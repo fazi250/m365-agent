@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M365 Agent</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --side: #eef0f4; --text: #1d2330; --muted: #677085; --line: #dfe3ea;
+    --accent: #2f6fde; --accent-text: #ffffff; --you: #e5eefd; --ok: #1f8a4c; --warn: #a86400; --err: #c62828;
+    --mono-bg: #f1f3f6; --hover: #e3e7ee; --active: #d6e2fb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c; --panel: #1c2027; --side: #181b21; --text: #e6e9ef; --muted: #98a1b3; --line: #2c323c;
+      --accent: #5b8ff0; --accent-text: #0d1117; --you: #22304a; --ok: #4cc27f; --warn: #e3a344; --err: #ef6a6a;
+      --mono-bg: #12151a; --hover: #232832; --active: #263552;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14.5px/1.5 system-ui, "Segoe UI", sans-serif; }
+  .app { display: grid; grid-template-columns: 270px 1fr; height: 100vh; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button:disabled { opacity: .5; cursor: default; }
+
+  aside { background: var(--side); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  .brand { display: flex; align-items: center; gap: 8px; padding: 14px 14px 10px; }
+  .brand h1 { font-size: 16px; margin: 0; flex: 1; }
+  .side-actions { display: flex; gap: 8px; padding: 0 14px 10px; }
+  .side-actions button { flex: 1; }
+  .side-label { padding: 6px 14px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  #chats { flex: 1; overflow-y: auto; padding: 0 8px 12px; }
+  .chat-row { display: flex; align-items: center; border-radius: 8px; }
+  .chat-row:hover { background: var(--hover); }
+  .chat-row.active { background: var(--active); }
+  .chat { flex: 1; min-width: 0; text-align: left; border: none; background: transparent; padding: 8px 10px;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+  .chat-del { border: none; background: transparent; color: var(--muted); padding: 4px 8px; opacity: 0; }
+  .chat-row:hover .chat-del, .chat-row.active .chat-del, .chat-del:focus-visible { opacity: 1; }
+  .chat-del:hover { color: var(--err); }
+  #deleteChat { color: var(--err); border-color: var(--err); background: transparent; }
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 10px; }
+  .side-foot { padding: 10px 14px 14px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
+  #rulesBtn { width: 100%; }
+  .always-note { font-size: 12px; color: var(--muted); margin-top: 6px; overflow-wrap: anywhere; }
+  .warn-note { font-size: 13px; color: var(--err); font-weight: 600; margin-top: 4px; overflow-wrap: anywhere; }
+  dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text); width: min(640px, 92vw); padding: 18px; }
+  dialog::backdrop { background: rgba(0, 0, 0, .45); }
+  dialog h3 { margin: 0 0 4px; font-size: 16px; }
+  .rule { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-top: 1px solid var(--line); }
+  .rule div { flex: 1; overflow-wrap: anywhere; font-size: 13px; }
+  .rule b { font-weight: 600; }
+  button.danger { width: 100%; color: var(--err); border-color: var(--err); background: transparent; }
+
+  main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .top { padding: 12px 20px 10px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .title-row { display: flex; align-items: center; gap: 10px; }
+  #title { font-size: 15px; font-weight: 600; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pill { font-size: 12px; padding: 2px 10px; border-radius: 99px; background: var(--mono-bg); color: var(--muted); }
+  .pill.busy { color: var(--warn); }
+  #tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .tool { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 99px; padding: 3px 10px; font-size: 13px; cursor: pointer; user-select: none; }
+  .tool input { margin: 0; }
+  .tool small { color: var(--muted); }
+  .tool:has(input:checked) { border-color: var(--accent); }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .mode-row { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
+  .mode-row .hint { margin-top: 0; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { border: none; border-radius: 0; padding: 4px 14px; background: transparent; }
+  .seg button[aria-checked="true"] { background: var(--accent); color: var(--accent-text); }
+  #tools.off { opacity: .45; pointer-events: none; }
+  #changes { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 20px; max-height: 45vh; overflow-y: auto; }
+  .changes-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .changes-head .hint { margin: 0; }
+  .grow { flex: 1; }
+  .change { border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; }
+  .change-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; }
+  .change-path { flex: 1; min-width: 0; font: 12.5px ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+  .kind { font-size: 11px; border-radius: 99px; padding: 0 7px; border: 1px solid var(--line); color: var(--muted); }
+  .plus { color: var(--ok); font-size: 12px; } .minus { color: var(--err); font-size: 12px; }
+  .change-row button { padding: 3px 10px; font-size: 13px; }
+  .diff { margin: 0; border-top: 1px solid var(--line); border-radius: 0 0 8px 8px; max-height: 360px; }
+  .diff span { display: block; white-space: pre-wrap; }
+  .diff .add { background: rgba(31, 138, 76, .16); } .diff .del { background: rgba(198, 40, 40, .14); }
+  .diff .gap { color: var(--muted); font-style: italic; }
+
+  #log { flex: 1; overflow-y: auto; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; overflow-wrap: anywhere; max-width: 900px; }
+  .msg.you { background: var(--you); align-self: flex-end; max-width: 80%; white-space: pre-wrap; }
+  .msg.copilot { white-space: pre-wrap; }
+  .msg.done { border-color: var(--ok); white-space: pre-wrap; }
+  .msg.done ul { margin: 6px 0 0; padding-left: 20px; white-space: normal; }
+  .msg.question { border: 2px solid var(--warn); }
+  .msg.question .q { white-space: pre-wrap; font-weight: 600; }
+  .msg.question input { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+  .msg.error { border-color: var(--err); color: var(--err); }
+  .msg.status { background: transparent; border: none; padding: 0 4px; color: var(--muted); font-size: 13px; }
+  .label { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .badge { font-size: 11px; border: 1px solid var(--line); border-radius: 99px; padding: 0 7px; margin-right: 6px; color: var(--muted); }
+  .call-name { font-weight: 600; }
+  .why { color: var(--muted); font-size: 13px; }
+  pre { margin: 6px 0 0; padding: 8px 10px; background: var(--mono-bg); border-radius: 6px; font: 12.5px/1.45 ui-monospace, Consolas, monospace; white-space: pre-wrap; max-height: 280px; overflow: auto; }
+  .actions { display: flex; gap: 8px; margin-top: 8px; align-items: center; font-size: 13px; color: var(--muted); }
+
+  form { display: flex; gap: 8px; padding: 12px 20px 16px; border-top: 1px solid var(--line); background: var(--panel); }
+  textarea { flex: 1; resize: none; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-height: 46px; max-height: 180px; }
+  @media (max-width: 720px) { .app { grid-template-columns: 1fr; } aside { display: none; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="brand"><h1>M365 Agent</h1><span id="state" class="pill">…</span></div>
+    <div class="side-actions">
+      <button id="newChat" class="primary">New chat</button>
+      <button id="refresh" title="Sync chats from Copilot">Sync</button>
+    </div>
+    <div class="side-label">Copilot chats</div>
+    <div id="closedNote" class="empty" hidden>The Copilot app is closed. It opens again (minimized) when you send a message, open a chat or press Sync.</div>
+    <div id="chats"><div class="empty">Loading…</div></div>
+    <div class="side-foot">
+      <button id="rulesBtn" title="Calls you chose to always allow">Allowed always (0)</button>
+      <button id="deleteAll" class="danger" title="Delete every chat in Microsoft 365 Copilot">Delete all chats</button>
+    </div>
+  </aside>
+  <main>
+    <div class="top">
+      <div class="title-row"><h2 id="title">New chat</h2><button id="deleteChat" hidden>Delete chat</button><button id="stop" disabled>Stop</button></div>
+      <div class="mode-row">
+        <div class="seg" role="radiogroup" aria-label="Mode">
+          <button id="modeAgent" role="radio">Agent</button><button id="modeChat" role="radio">Chat</button>
+        </div>
+        <span class="hint" id="modeHint"></span>
+      </div>
+      <div id="tools"></div>
+    </div>
+    <div id="log"></div>
+    <dialog id="rulesDlg">
+      <h3>Allowed always</h3>
+      <div class="hint">These run without asking. Remove one and it asks again next time.</div>
+      <div id="rulesList"></div>
+      <div class="actions" style="justify-content:flex-end"><button id="rulesClose">Close</button></div>
+    </dialog>
+    <section id="changes" hidden aria-label="Files changed by the agent">
+      <div class="changes-head">
+        <b id="changesTitle">Files changed</b>
+        <span class="hint">Review, then keep or undo. Undo restores the original (or removes a new file).</span>
+        <span class="grow"></span>
+        <button id="keepAll" class="primary">Keep all</button><button id="undoAll">Undo all</button>
+      </div>
+      <div id="changeList"></div>
+    </section>
+    <form id="form">
+      <textarea id="input" rows="1" placeholder="Message Copilot…"></textarea>
+      <button class="primary" id="send">Send</button>
+    </form>
+  </main>
+</div>
+<script>
+const MARK = "[local-agent]";
+const $ = (id) => document.getElementById(id);
+const log = $("log"), input = $("input");
+let chats = [], viewing = null, busy = false, statusEl = null, rules = [];
+const saved = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const store = (k, v) => { try { localStorage.setItem(k, v); } catch { /* private window: keep it for this visit */ } };
+let selectedTools = saved("tools") ? new Set(JSON.parse(saved("tools"))) : null; // null: all tools (first visit)
+let mode = saved("mode") || "agent"; // agent: Copilot may use the ticked tools; chat: the message goes as it is
+
+function setMode(m) {
+  mode = m; store("mode", m);
+  $("modeAgent").setAttribute("aria-checked", String(m === "agent"));
+  $("modeChat").setAttribute("aria-checked", String(m === "chat"));
+  $("tools").classList.toggle("off", m === "chat");
+  $("modeHint").textContent = m === "agent"
+    ? "Copilot answers questions directly and uses the ticked tools when you ask it to do something."
+    : "Plain Copilot chat: no tools, the message goes as you typed it.";
+}
+
+// ── rendering ──
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function pre(text) { return el("pre", "", text); }
+function add(node) { log.appendChild(node); log.scrollTop = log.scrollHeight; return node; }
+function msg(cls, text) { return add(el("div", "msg " + cls, text)); }
+
+function parseCall(text) {
+  const s = text.indexOf("{"), e = text.lastIndexOf("}");
+  if (s < 0 || e < s) return null;
+  try { const o = JSON.parse(text.slice(s, e + 1)); return typeof o.tool === "string" ? o : null; }
+  catch { try { const o = JSON.parse(text.slice(s, e + 1).replace(/\\(["\\/bfnrtu]?)/g, (m, c) => c ? m : "\\\\")); return typeof o.tool === "string" ? o : null; } catch { return null; } }
+}
+function argsText(a) {
+  if (a == null) return "";
+  if (typeof a.command === "string") return a.command + (a.cwd ? `\n(in ${a.cwd})` : "");
+  if (Array.isArray(a.args)) return "gh " + a.args.join(" ");
+  if (typeof a.path === "string" && a.content == null) return a.path;
+  return JSON.stringify(a, null, 2);
+}
+function callCard(call) {
+  const d = add(el("div", "msg"));
+  const head = el("div");
+  head.append(el("span", "call-name", call.tool), document.createTextNode(" "), el("span", "why", call.why ? "— " + call.why : ""));
+  d.append(head, pre(argsText(call.args)));
+  return d;
+}
+function resultCard(tool, text) {
+  const d = add(el("div", "msg"));
+  d.append(el("div", "label", "result · " + tool), pre(text));
+}
+function doneCard(text, checks) {
+  const d = add(el("div", "msg done"));
+  d.append(el("div", "label", "Done"), el("div", "", text));
+  if (checks && checks.length) {
+    const ul = el("ul");
+    for (const c of checks) ul.append(el("li", "", String(c)));
+    d.append(el("div", "label", "What Copilot checked"), ul);
+  }
+}
+
+// Copilot's ask_user: the task waits until you answer here (Continue with an empty box = "done, go on")
+let titleBefore = null;
+function questionCard(ev) {
+  const d = add(el("div", "msg question"));
+  d.append(el("div", "label", "Copilot is asking you. The task waits for your answer."), el("div", "q", ev.text));
+  const row = el("div", "actions");
+  const input = el("input");
+  input.placeholder = "Your answer (or leave empty and press Continue when the step is done)";
+  const go = el("button", "primary", "Continue");
+  const answer = async () => {
+    go.disabled = input.disabled = true;
+    const text = input.value.trim();
+    const r = await post("/api/answer", { id: ev.id, text });
+    row.replaceChildren(el("span", "", r.ok ? (text ? "answered: " + text : "continued") : "this question is closed (answered or stopped)"));
+    if (titleBefore != null) { document.title = titleBefore; titleBefore = null; }
+  };
+  go.onclick = answer;
+  input.onkeydown = (e) => { if (e.key === "Enter") answer(); };
+  row.append(input, go);
+  d.append(row);
+  input.focus();
+  if (titleBefore == null) { titleBefore = document.title; document.title = "❓ Copilot is asking you"; }
+}
+
+// a message as stored in Copilot (history) → the same cards the live view shows
+function renderStored(m) {
+  if (m.role === "user") {
+    const cut = m.text.indexOf("\n" + MARK + " ");
+    if (cut > 0) { // an agent task: "<task>\n\n[local-agent] instructions…"
+      const d = msg("you", ""); d.append(el("span", "badge", "agent"), document.createTextNode(m.text.slice(0, cut).trim())); return;
+    }
+    if (m.text.startsWith(MARK)) {
+      const r = m.text.match(/^\[local-agent\] RESULT of (\S+):\s*\n([\s\S]*?)\n\s*Next tool call/);
+      if (r) return resultCard(r[1], r[2]);
+      if (m.text.startsWith(MARK + " Before you finish")) return msg("status", "(asked Copilot to verify every part of the task before finishing)");
+      return msg("status", "(asked Copilot to reply with a tool call)");
+    }
+    return msg("you", m.text);
+  }
+  const call = parseCall(m.text);
+  if (call) return call.tool === "done" ? doneCard(String(call.args?.answer ?? ""), [].concat(call.args?.checks ?? [])) : callCard(call);
+  return msg("copilot", m.text);
+}
+
+function setStatus(text) {
+  if (!statusEl) statusEl = el("div", "msg status");
+  statusEl.textContent = text;
+  add(statusEl);
+}
+function clearStatus() { statusEl?.remove(); statusEl = null; }
+
+function setBusy(b) {
+  busy = b;
+  $("send").disabled = b; $("stop").disabled = !b; $("newChat").disabled = b; $("refresh").disabled = b; $("deleteAll").disabled = b;
+  $("deleteChat").disabled = b;
+  document.querySelectorAll(".chat, .chat-del").forEach((c) => (c.disabled = b));
+  $("state").textContent = b ? "working" : "ready";
+  $("state").classList.toggle("busy", b);
+  if (!b) clearStatus();
+}
+
+function renderChats() {
+  const box = $("chats");
+  box.replaceChildren();
+  if (!chats.length) { box.append(el("div", "empty", "No chats in Copilot yet.")); return; }
+  for (const c of chats) {
+    const row = el("div", "chat-row" + (c.id === viewing ? " active" : ""));
+    const b = el("button", "chat", c.title || "(untitled)");
+    b.title = c.title; b.disabled = busy;
+    b.onclick = () => openChat(c.id);
+    const del = el("button", "chat-del", "🗑");
+    del.title = "Delete this chat from Copilot"; del.setAttribute("aria-label", `Delete chat ${c.title}`); del.disabled = busy;
+    del.onclick = () => deleteChat(c.id);
+    row.append(b, del);
+    box.append(row);
+  }
+}
+function setTitle() {
+  const c = chats.find((x) => x.id === viewing);
+  $("title").textContent = viewing ? (c?.title || "Chat") : "New chat";
+  $("deleteChat").hidden = !viewing;
+}
+
+function renderTools(tools) {
+  if (!selectedTools) selectedTools = new Set(tools.map((t) => t.name)); // first visit: every tool, like an agent
+  // a tool added since your last visit starts ticked; the ones you unticked stay unticked
+  // (pages from before this list existed knew every tool except screen)
+  const known = new Set(JSON.parse(saved("knownTools") || "null") ?? tools.map((t) => t.name).filter((n) => n !== "screen"));
+  for (const t of tools) if (!known.has(t.name)) selectedTools.add(t.name);
+  store("knownTools", JSON.stringify(tools.map((t) => t.name)));
+  store("tools", JSON.stringify([...selectedTools]));
+  const box = $("tools");
+  box.replaceChildren();
+  for (const t of tools) {
+    const lab = el("label", "tool"); lab.title = t.description;
+    const cb = el("input"); cb.type = "checkbox"; cb.checked = selectedTools.has(t.name);
+    cb.onchange = () => { cb.checked ? selectedTools.add(t.name) : selectedTools.delete(t.name); store("tools", JSON.stringify([...selectedTools])); };
+    lab.append(cb, document.createTextNode(t.name), el("small", "", t.approval));
+    box.append(lab);
+  }
+}
+
+function renderRules() {
+  $("rulesBtn").textContent = `Allowed always (${rules.length})`;
+  const box = $("rulesList");
+  box.replaceChildren();
+  if (!rules.length) { box.append(el("div", "empty", "Nothing yet. Use Always allow on an approval to add one.")); return; }
+  for (const r of rules) {
+    const row = el("div", "rule");
+    const text = el("div");
+    text.append(el("b", "", r.tool), document.createTextNode(" — " + r.label));
+    const rm = el("button", "", "Remove");
+    rm.onclick = () => fetch("/api/rules/remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool: r.tool, key: r.key }) });
+    row.append(text, rm);
+    box.append(row);
+  }
+}
+
+// ── Keep / Undo for files the agent changed ──
+const post = (url, body) => fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body ?? {}) });
+
+function renderChanges(list) {
+  $("changes").hidden = !list.length;
+  $("changesTitle").textContent = `${list.length} file${list.length === 1 ? "" : "s"} changed`;
+  const box = $("changeList");
+  const open = new Set([...box.querySelectorAll(".change[data-open]")].map((d) => d.dataset.path));
+  box.replaceChildren();
+  for (const c of list) {
+    const card = el("div", "change"); card.dataset.path = c.path;
+    const row = el("div", "change-row");
+    const diffBtn = el("button", "", "Diff"), keep = el("button", "", "Keep"), undo = el("button", "", "Undo");
+    keep.title = "Keep this change"; undo.title = c.kind === "new" ? "Remove this new file" : "Put the original back";
+    row.append(el("span", "kind", c.kind), el("span", "change-path", c.path), el("span", "plus", `+${c.added}`),
+      el("span", "minus", `−${c.removed}`), diffBtn, keep, undo);
+    card.append(row);
+    diffBtn.onclick = () => toggleDiff(card, c.path);
+    keep.onclick = () => post("/api/changes/keep", { path: c.path });
+    undo.onclick = async () => {
+      const r = await post("/api/changes/undo", { path: c.path });
+      if (!r.ok) msg("error", "Undo failed: " + ((await r.json().catch(() => ({}))).error || r.status));
+    };
+    box.append(card);
+    if (open.has(c.path)) toggleDiff(card, c.path);
+  }
+}
+
+async function toggleDiff(card, p) {
+  const shown = card.querySelector(".diff");
+  if (shown) { shown.remove(); delete card.dataset.open; return; }
+  card.dataset.open = "1";
+  const r = await fetch("/api/changes/diff?path=" + encodeURIComponent(p));
+  if (!r.ok) return;
+  const { lines } = await r.json();
+  const view = el("pre", "diff");
+  // unchanged runs longer than 6 lines collapse to their first and last 2 lines
+  for (let i = 0; i < lines.length;) {
+    if (lines[i].t !== " ") { view.append(el("span", lines[i].t === "+" ? "add" : "del", lines[i].t + " " + lines[i].s)); i++; continue; }
+    let j = i; while (j < lines.length && lines[j].t === " ") j++;
+    const run = lines.slice(i, j);
+    const show = run.length > 6 ? [...run.slice(0, 2), null, ...run.slice(-2)] : run;
+    for (const l of show) view.append(l ? el("span", "", "  " + l.s) : el("span", "gap", `  … ${run.length - 4} unchanged lines`));
+    i = j;
+  }
+  card.append(view);
+}
+$("keepAll").onclick = () => post("/api/changes/keep");
+$("undoAll").onclick = async () => {
+  if (!confirm("Undo every change listed here? New files the agent created are removed; changed files get their original back.")) return;
+  const r = await post("/api/changes/undo");
+  if (!r.ok) msg("error", "Undo failed: " + ((await r.json().catch(() => ({}))).error || r.status));
+};
+
+// ── actions ──
+async function openChat(id) {
+  if (busy) return;
+  viewing = id; renderChats(); setTitle();
+  log.replaceChildren(); setStatus("opening in Copilot…");
+  const r = await fetch("/api/open", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
+  clearStatus();
+  if (!r.ok) return msg("error", "Could not open: " + ((await r.json().catch(() => ({}))).error || r.status));
+  const { messages } = await r.json();
+  if (!messages.length) msg("status", "(no messages could be read)");
+  messages.forEach(renderStored);
+}
+async function deleteChat(id) {
+  if (busy) return;
+  const c = chats.find((x) => x.id === id);
+  if (!confirm(`Delete "${c?.title || "this chat"}" from Microsoft 365 Copilot?\nIt is deleted in Copilot itself and cannot be recovered.`)) return;
+  if (viewing === id) newChat();
+  setStatus("deleting the chat in Copilot…");
+  const r = await fetch("/api/chats/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
+  clearStatus();
+  if (!r.ok) msg("error", "Could not delete: " + ((await r.json().catch(() => ({}))).error || r.status));
+  else msg("status", `Deleted "${c?.title || "chat"}" from Copilot.`);
+}
+function newChat() {
+  if (busy) return;
+  viewing = null; renderChats(); setTitle();
+  log.replaceChildren(msg("status", "New chat. It is created in Copilot when you send the first message."));
+  input.focus();
+}
+
+$("form").onsubmit = async (e) => {
+  e.preventDefault();
+  const message = input.value.trim();
+  if (!message || busy) return;
+  input.value = "";
+  const r = await fetch("/api/send", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chatId: viewing, message, tools: mode === "agent" ? [...selectedTools] : [] }) });
+  if (r.status === 409) msg("error", "Still busy with the previous message.");
+};
+input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); } });
+$("stop").onclick = () => fetch("/api/stop", { method: "POST" });
+$("newChat").onclick = newChat;
+$("rulesBtn").onclick = () => $("rulesDlg").showModal();
+$("rulesClose").onclick = () => $("rulesDlg").close();
+$("deleteChat").onclick = () => viewing && deleteChat(viewing);
+$("refresh").onclick = () => fetch("/api/chats/refresh", { method: "POST" });
+$("deleteAll").onclick = async () => {
+  if (busy) return;
+  const typed = prompt(`Delete all ${chats.length} chats from Microsoft 365 Copilot?\nThey are deleted in Copilot itself and cannot be recovered.\n\nType DELETE to confirm.`);
+  if (typed === null) return; // Cancel
+  if (typed.trim().toUpperCase() !== "DELETE") return msg("error", `Nothing deleted: type DELETE to confirm (you typed "${typed}").`);
+  newChat();
+  const r = await fetch("/api/chats/delete-all", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: "DELETE" }) });
+  if (!r.ok) msg("error", "Delete all didn't start: " + ((await r.json().catch(() => ({}))).error || r.status));
+  else msg("status", "Deleting the chats in Copilot one by one…");
+};
+
+// ── live events ──
+const es = new EventSource("/api/events");
+es.onerror = () => { $("state").textContent = "server offline"; };
+es.onmessage = (e) => {
+  const ev = JSON.parse(e.data);
+  switch (ev.type) {
+    case "busy": setBusy(true); break;
+    case "idle": setBusy(false); break;
+    case "chats": chats = ev.chats; $("closedNote").hidden = true; renderChats(); setTitle(); break;
+    case "copilot-closed": $("closedNote").hidden = false; break;
+    case "created": // the Copilot chat our first message just started
+      if (viewing === null) { viewing = ev.id; renderChats(); setTitle(); }
+      break;
+    case "status": setStatus(ev.text); break;
+    case "user": {
+      const d = msg("you", "");
+      if (mode === "agent" && selectedTools.size) d.append(el("span", "badge", "agent"));
+      d.append(document.createTextNode(ev.text));
+      break;
+    }
+    case "reply": clearStatus(); msg("copilot", ev.text); break;
+    case "call": clearStatus(); callCard(ev.call); break;
+    case "approve": {
+      const d = add(el("div", "msg"));
+      d.append(el("div", "label", "Copilot wants to run this. Check it first."), el("div", "call-name", ev.call.tool),
+        pre(ev.call.tool === "write_file" ? ev.call.args.path + "\n\n" + (ev.call.args.content ?? "") : argsText(ev.call.args)));
+      if (ev.warning) d.append(el("div", "warn-note", "⚠ " + ev.warning));
+      const row = el("div", "actions");
+      const once = el("button", "primary", "Allow once"), always = el("button", "", "Always allow"), deny = el("button", "", "Deny");
+      const task = ev.task ? el("button", "", "Allow for this task") : null;
+      always.title = "Don't ask again for " + ev.always;
+      if (task) task.title = "Don't ask again for " + ev.task;
+      const answer = (decision, text) => {
+        [once, task, always, deny].forEach((b) => b && (b.disabled = true));
+        fetch("/api/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: ev.id, decision }) });
+        row.append(el("span", "", text));
+      };
+      once.onclick = () => answer("once", "allowed once");
+      if (task) task.onclick = () => answer("task", "allowed for this task");
+      always.onclick = () => answer("always", "allowed, and saved");
+      deny.onclick = () => answer("deny", "denied");
+      row.append(...[once, task, always, deny].filter(Boolean));
+      d.append(row);
+      if (ev.unkept) d.append(el("div", "always-note", `${ev.unkept} changed file(s) are not kept yet, so this asks even if you allowed it before: it may run that code.`));
+      if (ev.task) d.append(el("div", "always-note", "Allow for this task = no more questions for " + ev.task));
+      d.append(el("div", "always-note", "Always allow = never ask again for " + ev.always));
+      break;
+    }
+    case "allowed": msg("status", "Allowed by your rule: " + ev.text); break;
+    case "changes": renderChanges(ev.changes); break;
+    case "rules": rules = ev.rules; renderRules(); break;
+    case "result": resultCard(ev.tool, ev.text); break;
+    case "question": clearStatus(); questionCard(ev); break;
+    case "note": msg("status", ev.text); break;
+    case "done": clearStatus(); doneCard(ev.text, ev.checks); break;
+    case "error": clearStatus(); msg("error", ev.text); break;
+    case "deleted":
+      clearStatus();
+      msg(ev.error ? "error" : "status", `Deleted ${ev.count} chat(s) from Copilot.` + (ev.error ? ` Stopped: ${ev.error}` : "") + (ev.left ? ` ${ev.left} left.` : ""));
+      break;
+  }
+};
+
+fetch("/api/state").then((r) => r.json()).then((s) => {
+  chats = s.chats; rules = s.rules ?? []; renderRules(); renderChanges(s.changes ?? []); renderTools(s.tools); setMode(mode); renderChats(); setBusy(s.busy); newChat();
+});
+$("modeAgent").onclick = () => setMode("agent");
+$("modeChat").onclick = () => setMode("chat");
+</script>
+</body>
+</html>

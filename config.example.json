@@ -1,0 +1,11 @@
+{
+  "port": 4317,
+  "workspace": "workspace",
+  "projects": [
+    "C:/devl"
+  ],
+  "readRoots": [],
+  "browser": "msedge",
+  "maxSteps": 40,
+  "maxResult": 8000
+}
