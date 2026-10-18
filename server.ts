@@ -23,10 +23,33 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 // bridgeScript replaces bridge.ps1, e.g. with a fake one for testing without Copilot.
 const defaults = {
   port: 4317, workspace: "workspace", projects: [] as string[], readRoots: [] as string[], maxSteps: 40, maxResult: 8000,
-  bridgeScript: "", browser: "msedge",
+  bridgeScript: "", browser: "msedge", pythonIndexUrl: "",
 };
 const configFile = process.env.M365_AGENT_CONFIG ? path.resolve(process.env.M365_AGENT_CONFIG) : path.join(ROOT, "config.json");
 const config = { ...defaults, ...(existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {}) };
+
+// Your organization's Python package index (an Artifactory or Nexus PyPI mirror), when PyPI itself is blocked:
+//   npm start -- --index-url <url>   ·   npm start --index-url=<url>   ·   "pythonIndexUrl" in config.json
+// Given on the command line, it is saved in config.json, so later starts (and setup.ps1) keep using it.
+function indexUrlFromCommandLine(): string {
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i++) {
+    const m = argv[i].match(/^--index-url(?:=(.+))?$/i);
+    if (m) return m[1] ?? argv[i + 1] ?? "";
+  }
+  const npmFlag = process.env.npm_config_index_url; // npm start --index-url=<url> (or "true" + the url as an argument)
+  if (npmFlag && npmFlag !== "true") return npmFlag;
+  return npmFlag === "true" ? argv.find((a) => /^https?:\/\//i.test(a)) ?? "" : "";
+}
+// a URL with a user name and token in it, shown without the token
+const hideSecret = (url: string) => url.replace(/\/\/([^/@:]+):[^/@]+@/, "//$1:***@");
+const cliIndexUrl = indexUrlFromCommandLine();
+if (cliIndexUrl && cliIndexUrl !== config.pythonIndexUrl) {
+  config.pythonIndexUrl = cliIndexUrl;
+  const saved = existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {};
+  writeFileSync(configFile, JSON.stringify({ ...saved, pythonIndexUrl: cliIndexUrl }, null, 2) + "\n", "utf8");
+  console.log(`Python packages now come from ${hideSecret(cliIndexUrl)} (saved as pythonIndexUrl in ${configFile})`);
+}
 const workspace = path.resolve(path.dirname(configFile), config.workspace); // relative to the config file
 mkdirSync(workspace, { recursive: true });
 const projects: string[] = config.projects.map((r: string) => path.resolve(r));
@@ -36,6 +59,7 @@ const ctx: ToolContext = {
   readRoots: [workspace, ...projects, ...config.readRoots.map((r: string) => path.resolve(r))],
   root: ROOT,
   python: path.join(ROOT, ".venv", "Scripts", "python.exe"),
+  pythonIndexUrl: String(config.pythonIndexUrl ?? ""),
   browserChannel: config.browser,
   trackWrite: (full) => trackWrite(full),
 };

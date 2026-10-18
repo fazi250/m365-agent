@@ -7,5 +7,6 @@
   "readRoots": [],
   "browser": "msedge",
   "maxSteps": 40,
-  "maxResult": 8000
+  "maxResult": 8000,
+  "pythonIndexUrl": ""
 }

@@ -12,7 +12,8 @@
   ],
   "scripts": {
     "setup": "powershell -ExecutionPolicy Bypass -File setup.ps1",
-    "start": "node server.ts"
+    "start": "node server.ts",
+    "diag": "powershell -NoProfile -STA -ExecutionPolicy Bypass -File bridge.ps1 diag"
   },
   "dependencies": {
     "playwright-core": "^1.56.0"

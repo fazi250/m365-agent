@@ -6,6 +6,8 @@
 #   bridge.ps1 open -Id <chat id>        -> same as read, after switching Copilot to that chat
 #   bridge.ps1 ask [-New]                message on stdin -> {"ok":true,"text":"<reply>"}
 #   bridge.ps1 delete -Id <chat id>      deletes that chat in Copilot (More > Delete > confirm) -> {"ok":true}
+#   bridge.ps1 diag                      plain-text report on finding and starting the app (also saved in diag.txt),
+#                                        for when it "did not open" on a PC: npm run diag
 #   every command accepts -Prev <hwnd>: the user's window from an earlier call (see Restore-Focus)
 #
 # Behind the scenes: the Copilot window is kept minimized (still open in the taskbar). Keyboard input only reaches
@@ -108,28 +110,111 @@ function Find-ByName($root, $name, $type) {
 }
 
 # ── window and focus ──
+# The app's main window. Its program is M365Copilot.exe; in case another build of the app (package
+# Microsoft.MicrosoftOfficeHub) names it differently, any program with a window from that package counts too.
 function Get-MainHandle {
   $p = Get-Process M365Copilot -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0 | Select-Object -First 1
+  if (-not $p) {
+    $p = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $_.Path -like "*\WindowsApps\Microsoft.MicrosoftOfficeHub_*" } | Select-Object -First 1
+  }
   if ($p) { $p.MainWindowHandle } else { [IntPtr]::Zero }
 }
 
+$LAYOUT_ID = "m365-copilot-app-layout-main"   # the chat screen; missing on sign-in and first-run screens
+$DIAG_HINT = "For details run in the m365-agent folder: npm run diag"
+
 # Not running: start it and wait for its real window. While starting, the app swaps a first window for the final
-# one, so the handle is looked up again until the chat layout is there.
+# one, so the handle is looked up again until the chat layout is there. The error says which part failed.
 function Get-CopilotWindow {
   $h = Get-MainHandle
   if ($h -ne [IntPtr]::Zero) { return $h }
   Start-Process "shell:AppsFolder\$APP_ID"
   $deadline = (Get-Date).AddSeconds(45)
+  $sawWindow = $false
   while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
     $h = Get-MainHandle
     if ($h -eq [IntPtr]::Zero) { continue }
-    if ($AE::FromHandle($h).FindFirst($TS::Descendants, (Cond $AE::AutomationIdProperty "m365-copilot-app-layout-main"))) {
+    $sawWindow = $true
+    if ($AE::FromHandle($h).FindFirst($TS::Descendants, (Cond $AE::AutomationIdProperty $LAYOUT_ID))) {
       Start-Sleep -Milliseconds 500
       return (Get-MainHandle)
     }
   }
-  throw "Microsoft 365 Copilot app did not open"
+  if ($sawWindow) {
+    throw "Microsoft 365 Copilot app opened, but its chat screen did not appear within 45 s (signed out, a sign-in or first-run screen, or a different layout). Open the app once yourself, sign in and close it. $DIAG_HINT"
+  }
+  if (-not (Get-StartApps | Where-Object AppID -eq $APP_ID)) {
+    throw "Microsoft 365 Copilot app is not installed for this Windows user (no app $APP_ID). Install 'Microsoft 365 Copilot' from the Microsoft Store or Company Portal. $DIAG_HINT"
+  }
+  throw "Microsoft 365 Copilot app did not open a window within 45 s. $DIAG_HINT"
+}
+
+# ── diag: what this PC has and does when the app is started, as plain text (and diag.txt) ──
+function Diagnose {
+  $lines = New-Object System.Collections.Generic.List[string]
+  function Say([string]$s) { $lines.Add($s); [Console]::Out.WriteLine($s) }
+  function Windowed {
+    Get-Process -ErrorAction SilentlyContinue | Where-Object {
+      $_.MainWindowHandle -ne 0 -and ($_.ProcessName -match 'copilot|officehub|m365' -or $_.MainWindowTitle -match 'copilot|microsoft 365' -or
+        $_.Path -like '*\WindowsApps\Microsoft.MicrosoftOfficeHub_*')
+    } | ForEach-Object { Say "  $($_.ProcessName) (pid $($_.Id)) window '$($_.MainWindowTitle)'  $($_.Path)" }
+  }
+  Say "== M365 Agent diag, $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+  Say "Windows $([Environment]::OSVersion.Version), PowerShell $($PSVersionTable.PSVersion), user $env:USERNAME"
+  Say "== Start-menu apps named like Copilot / Microsoft 365 / Office (the bridge starts AppID $APP_ID)"
+  $apps = @(Get-StartApps | Where-Object { $_.Name -match 'copilot|microsoft 365|office' })
+  if ($apps) { $apps | ForEach-Object { Say "  $($_.Name)  ->  $($_.AppID)$(if ($_.AppID -eq $APP_ID) { '   <== the one the bridge uses' })" } } else { Say "  (none)" }
+  Say "== Installed app packages"
+  $pk = @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'OfficeHub|Copilot' })
+  if ($pk) { $pk | ForEach-Object { Say "  $($_.Name) $($_.Version) ($($_.Status))" } } else { Say "  (none)" }
+  Say "== Programs with a window, before starting"
+  Windowed
+  $h = Get-MainHandle
+  if ($h -eq [IntPtr]::Zero) {
+    Say "== No Copilot window: starting shell:AppsFolder\$APP_ID and waiting up to 40 s"
+    try { Start-Process "shell:AppsFolder\$APP_ID" } catch { Say "  start failed: $($_.Exception.Message)" }
+    for ($i = 0; $i -lt 80 -and $h -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 500; $h = Get-MainHandle }
+    Start-Sleep -Seconds 5   # let it draw its first screen
+    $h = Get-MainHandle
+    Say "== Programs with a window, after starting"
+    Windowed
+  }
+  if ($h -eq [IntPtr]::Zero) {
+    Say "== RESULT: no window from M365Copilot.exe or the Microsoft.MicrosoftOfficeHub package"
+  } else {
+    $root = $AE::FromHandle($h)
+    Say "== Copilot window: '$($root.Current.Name)', class $($root.Current.ClassName), minimized: $([W]::IsIconic($h))"
+    $layout = $null
+    for ($i = 0; $i -lt 40 -and -not $layout; $i++) {   # the chat screen can take a while after the window shows
+      $layout = $root.FindFirst($TS::Descendants, (Cond $AE::AutomationIdProperty $LAYOUT_ID))
+      if (-not $layout) { Start-Sleep -Milliseconds 500 }
+    }
+    $web = $root.FindFirst($TS::Descendants, (Cond $AE::AutomationIdProperty "RootWebArea"))
+    Say "  chat screen ($LAYOUT_ID): $(if ($layout) { 'found' } else { 'NOT found within 20 s' })"
+    Say "  web page (RootWebArea): $(if ($web) { "found, '$($web.Current.Name)'" } else { 'NOT found' })"
+    Say "  chat links in the sidebar: $(@(Get-Chats $root).Count)"
+    Say "== Controls with an id (first 60; chat ids left out)"
+    $n = 0
+    foreach ($e in $root.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
+      $aid = $e.Current.AutomationId
+      if (-not $aid -or $aid -match $GUID -or $aid -match '^\d+$') { continue }
+      $name = ($e.Current.Name -replace '\s+', ' '); if ($name.Length -gt 50) { $name = $name.Substring(0, 50) + "..." }
+      Say "  $($e.Current.ControlType.ProgrammaticName -replace 'ControlType\.', '') id=$aid '$name'"
+      if (++$n -ge 60) { break }
+    }
+    Say "== Texts that look like a sign-in or start screen"
+    $hits = 0
+    foreach ($e in $root.FindAll($TS::Descendants, (Cond $AE::ControlTypeProperty $CT::Text))) {
+      if ($e.Current.Name -match 'sign in|sign-in|log in|welcome|get started|account|license|licence|not available|admin') {
+        Say "  '$($e.Current.Name)'"; if (++$hits -ge 15) { break }
+      }
+    }
+    if (-not $hits) { Say "  (none)" }
+  }
+  $file = Join-Path $PSScriptRoot "diag.txt"
+  [IO.File]::WriteAllLines($file, $lines)
+  Say "== saved in $file"
 }
 
 # Copilot sometimes restores its own window while it is used in the background (seen right after a message is
@@ -432,6 +517,10 @@ function Close-Popups($root) {
 }
 
 # ── main ──
+if ($Cmd -eq "diag") {
+  try { Diagnose } catch { [Console]::Out.WriteLine("diag stopped: $($_.Exception.Message)") }
+  exit 0
+}
 try {
   if ($NoLaunch -and (Get-MainHandle) -eq [IntPtr]::Zero) { Out-Json @{ ok = $true; closed = $true; chats = @() }; exit 0 }
   $h = Get-CopilotWindow

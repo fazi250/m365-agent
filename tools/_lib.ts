@@ -9,6 +9,7 @@ export type ToolContext = {
   readRoots: string[]; // folders read_file / list_dir may look into (workspace and projects included)
   root: string; // the project folder
   python: string; // the project's venv Python (.venv), for the document tools
+  pythonIndexUrl: string; // your organization's PyPI mirror (Artifactory ...) for pip installs; "" = PyPI / pip's own settings
   browserChannel: string; // "chrome" or "msedge"
   // call before changing or creating a file: the server keeps its original so the page can offer Keep / Undo
   trackWrite: (fullPath: string) => void;

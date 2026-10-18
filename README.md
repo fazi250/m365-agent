@@ -50,6 +50,14 @@ npm run setup
 
 `npm run setup` (or `powershell -ExecutionPolicy Bypass -File setup.ps1`) installs `playwright-core`, creates the Python venv in `.venv` with `python-docx`, `python-pptx` and `pillow` from `requirements.txt`, and creates `config.json` from `config.example.json`. Check `config.json` (see [Configuration](#configuration)), then start it:
 
+On a company PC where PyPI is blocked and Python packages come from your organization's index (Artifactory, Nexus ...), give its URL once; it is saved as `pythonIndexUrl` in `config.json` and used by the setup and by `install_package` from then on:
+
+```
+npm run setup -- --index-url https://artifactory.example.com/api/pypi/pypi/simple
+```
+
+`npm start -- --index-url <url>`, `npm start --index-url=<url>` and `start.cmd --index-url <url>` work too. A URL with a user name and token in it is shown with the token hidden; `config.json` stays out of git.
+
 ```
 npm start
 ```
@@ -148,6 +156,7 @@ Handy `github` calls Copilot can make:
 | `browser` | `msedge` | `msedge` (Microsoft Edge) or `chrome` (Google Chrome, profile in `.browser-profile`); there is no switch to the other one if it is missing |
 | `maxSteps` | `40` | Tool steps per task before it stops |
 | `maxResult` | `8000` | Characters of tool output sent back to Copilot |
+| `pythonIndexUrl` | `""` | Your organization's Python package index (Artifactory or Nexus PyPI mirror) for the setup and `install_package`; empty = PyPI (or pip's own settings). Set it with `--index-url` (see [Install and run](#install-and-run)) |
 | `bridgeScript` | `bridge.ps1` | Another bridge script (relative to the config file), e.g. a fake one for testing without Copilot |
 
 To run a second copy with other settings, point `M365_AGENT_CONFIG` at another config file; its `approvals.json` is kept next to that file.
@@ -174,6 +183,7 @@ To run a second copy with other settings, point `M365_AGENT_CONFIG` at another c
 
 | Problem | Fix |
 |---|---|
+| `Microsoft 365 Copilot app did not open …` / `… opened, but its chat screen did not appear …` / `… is not installed …` | Run `npm run diag` in this folder (or `powershell -STA -ExecutionPolicy Bypass -File bridge.ps1 diag`). It lists the Copilot apps and packages on the PC, starts the app, waits for its window and chat screen, and shows what it found (window, page, control ids, sign-in texts). The same text is saved in `diag.txt`: send that or a screenshot of it. Often the fix is to open the app once by hand, sign in with the work account and close it. |
 | `chat box not found` | Open the Copilot app once, make sure it is signed in and shows a chat. |
 | `Copilot: You've reached your daily limit` | Wait for the time shown, or sign in with your work account. |
 | `could not start a new chat in Copilot` / `New chat button not found` | Restore the Copilot window once and expand its sidebar, then minimize it again. |

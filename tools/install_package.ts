@@ -86,9 +86,11 @@ const tool: Tool = {
     }
 
     if (!existsSync(ctx.python)) return "the venv is missing: ask the user to run setup.ps1";
-    const viaUv = await runProcess("uv", ["pip", "install", "--python", ctx.python, ...pkgs], { cwd: ctx.root, timeoutMs: 300_000 });
+    // your organization's PyPI mirror (pythonIndexUrl in config.json), when you set one
+    const index = ctx.pythonIndexUrl ? ["--index-url", ctx.pythonIndexUrl] : [];
+    const viaUv = await runProcess("uv", ["pip", "install", "--python", ctx.python, ...index, ...pkgs], { cwd: ctx.root, timeoutMs: 300_000 });
     const out = viaUv.includes("[not found: uv]")
-      ? await runProcess(ctx.python, ["-m", "pip", "install", ...pkgs], { cwd: ctx.root, timeoutMs: 300_000 })
+      ? await runProcess(ctx.python, ["-m", "pip", "install", ...index, ...pkgs], { cwd: ctx.root, timeoutMs: 300_000 })
       : viaUv;
     if (/\[exit code \d+\]/.test(out)) return out;
     // keep them in the framework: add what requirements.txt doesn't list yet
