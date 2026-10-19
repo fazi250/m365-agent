@@ -8,5 +8,6 @@
   "browser": "msedge",
   "maxSteps": 40,
   "maxResult": 8000,
-  "pythonIndexUrl": ""
+  "pythonIndexUrl": "",
+  "copilotUrl": "https://m365.cloud.microsoft/chat"
 }

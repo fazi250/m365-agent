@@ -1,36 +1,36 @@
 # M365 Agent
 
-A local web app that turns the **Microsoft 365 Copilot desktop app** into a chat and agent engine for your PC.
+A local web app that turns **Microsoft 365 Copilot** (its website, in the agent's own Edge window) into a chat and agent engine for your PC.
 
 - **Your Copilot chats, synced.** The chats in Copilot's sidebar show up in the web app. Open one to read it and keep talking in it.
 - **Agent mode, like GitHub Copilot's.** Ask a question and Copilot just answers; ask it to do something and it works through the tools step by step on your PC: drive a browser, write Word / PowerPoint files, run Python, install the Python packages it needs into the framework, read files, run PowerShell, look things up on GitHub, or any tool you add. Chat and tasks mix freely in one conversation. **Chat** mode sends messages as they are.
 - **Repos, with Keep / Undo.** Ask it to create a repo from scratch or change an existing one under your `projects` folder (e.g. `C:/devl`). It writes whole files, like GitHub Copilot's agent, without asking; every changed file shows up under **Files changed** with its diff and **Keep** / **Undo**.
 - **Files anywhere on your PC, like GitHub Copilot.** It can read and write files anywhere with absolute paths. Inside your trusted folders (the workspace, `projects`, and `readRoots` for reading) it goes ahead on its own; anywhere else it asks you first, and sensitive files (`.env`, SSH keys, credentials, browser password stores ...) always ask, with a red warning on the card.
 - **One workspace folder.** Everything else the agent makes (reports, decks, screenshots, scripts) goes into `workspace/`.
-- **Behind the scenes.** The Copilot app stays minimized in the taskbar and never pops up. You only use `http://127.0.0.1:4317`.
+- **Behind the scenes.** Copilot runs in its own Edge window that stays minimized; it never takes your keyboard focus or your clipboard. You only use `http://127.0.0.1:4317`.
 
-No API keys and no GPU: it reuses the Copilot app you are already signed in to.
+No API keys and no GPU: it uses your Microsoft 365 Copilot account (sign in once in its window).
 
-> This is an unofficial tool, not affiliated with Microsoft. It drives the Copilot app's window through Windows UI Automation. Check that your organization's policies allow automating Microsoft 365 Copilot before you use it at work.
+> This is an unofficial tool, not affiliated with Microsoft. It drives the Microsoft 365 Copilot website in a browser window. Check that your organization's policies allow automating Microsoft 365 Copilot before you use it at work.
 
 ## How it works
 
 ```
- your browser ──► server.ts (127.0.0.1:4317) ──► bridge.ps1 ──► Microsoft 365 Copilot app (minimized)
-                     │   ▲                          types the message, reads the reply
+ your browser ──► server.ts (127.0.0.1:4317) ──► copilot-web.ts ──► m365.cloud.microsoft/chat in its own Edge (minimized)
+                     │   ▲                          puts the message in, reads the reply
                      ▼   │
                  tools/*.ts  (run on your PC, results go back to Copilot)
                      ├─ browser       its own Microsoft Edge window (playwright-core)
                      └─ make_docx / make_pptx   Python in .venv (python-docx, python-pptx)
 ```
 
-- `bridge.ps1` uses Windows UI Automation to list chats, open a chat, read its messages, send a message and delete chats. To type, it activates the minimized Copilot window for well under a second (keyboard input only reaches the active window) and then gives focus straight back to your window. Windows only lets a background program activate a window right after an Alt key press, so the bridge sends one (Alt down, activate, Alt up). It sends a key only after checking that Windows' keyboard focus is inside Copilot's page and on the right control: a key that reaches the bare minimized window would restore it (Enter does), and Copilot's own title-bar buttons (Maximize, Close) are page buttons too. If Copilot still brings its window up, it is minimized again at once. Reading needs no focus. If the app is not running, it starts it and minimizes it.
+- `copilot-web.ts` opens the Microsoft 365 Copilot website (the same web app the Copilot desktop app shows) in its own Edge window with its own profile (`.copilot-web-profile`), through playwright-core, and keeps it minimized. It lists the chats in Copilot's sidebar, opens a chat and reads its messages, puts a message into the chat box and waits for the reply (done when the reply has its "Copy Response" button and its text stopped changing), and deletes chats, all straight in the page: nothing needs keyboard focus, the clipboard or the desktop app, and a minimized window keeps working. Code blocks in replies come back with their exact text, as fenced blocks.
 - When tools are ticked, the first message tells Copilot which tools exist and asks it to answer with one JSON tool call per turn, for example `{"tool": "browser", "args": {"action": "click", "target": "e12", "evidence": true}}`. `server.ts` runs the tool, pastes the result back to Copilot, and repeats until Copilot answers with `done`. Copilot can also call `ask_user` to stop and ask you something (sign in first, pick one, a detail it doesn't have); the task waits for your answer. The first `done` of a task that used tools is sent back once with "verify every part of the request first", so Copilot checks its work (reads the page, the screen, the files it made) before it finishes, and its final `done` lists what it checked.
 
 ## Requirements
 
 - Windows 10 or 11
-- **Microsoft 365 Copilot** app (from the Microsoft Store), signed in. Use your **work account** if your organization's Copilot licence is the one you want: personal accounts have a daily usage limit. On some work PCs the same app is called just **Copilot** in the Start menu and runs `copilotapp.exe` from `Program Files (x86)\Microsoft\Copilot`; the bridge finds that one too.
+- A **Microsoft 365 Copilot** account. Use your **work account** if your organization's Copilot licence is the one you want: personal accounts have a daily usage limit. The first time the server starts, sign in in the Copilot window it opens (on a work PC this often happens on its own); the window remembers it. The Copilot desktop app is not needed.
 - **Node.js 23.6 or newer** (Node 24 LTS recommended). It runs the TypeScript files directly. Check with `node -v`.
 - **Microsoft Edge** (or Google Chrome, see `browser` below) for the `browser` tool; the installed browser is used, nothing is downloaded.
 - **Python 3.10 or newer** for the document tools (`uv` is used when installed, otherwise `python -m venv`).
@@ -67,7 +67,7 @@ or double-click `start.cmd`, which also opens the page. Open <http://127.0.0.1:4
 ## Using it
 
 - **Sidebar.** Your Copilot chats, newest first. **Sync** re-reads them; they also refresh every minute and after you send a message. Click a chat to open it in Copilot and see its messages here.
-- **Closing Copilot.** The minute-by-minute sync never starts the Copilot app: close it and it stays closed. It opens again, minimized, when you send a message, open a chat or press **Sync** (and when the server starts). To stop everything, close the `start.cmd` window (or Ctrl+C in it).
+- **The Copilot window.** The server opens Microsoft 365 Copilot in its own Edge window and minimizes it. When Copilot wants you to sign in, the window comes up and the page tells you; sign in there and press **Sync**. The minute-by-minute sync never opens the window: close it and it stays closed. It opens again when you send a message, open a chat or press **Sync** (and when the server starts).
 - **New chat.** Starts a fresh Copilot chat with your next message.
 - **Agent / Chat.** Agent (the default) gives Copilot the ticked tools: it answers questions directly and uses tools when you ask it to do something, in the same chat. Chat sends your message to Copilot as it is.
 - **Tools row.** All tools are ticked the first time; untick what you don't want Copilot to use. Each tool shows whether it runs on its own or asks first.
@@ -81,7 +81,7 @@ or double-click `start.cmd`, which also opens the page. Open <http://127.0.0.1:4
 - **Done** shows Copilot's answer and **What Copilot checked**: one line per part of your request, saying how it knows that part is done (or that it isn't).
 - **Stop** ends the current task right away: a command that is still running (PowerShell, Python, an install) is ended together with every program it started, and its step reports "stopped by the user".
 - **Delete one chat:** the 🗑 next to a chat in the sidebar (shown on hover and for the open chat), or **Delete chat** at the top of an open chat. It asks first; the chat is deleted in Copilot itself and cannot be recovered.
-- **Delete all chats** (bottom of the sidebar) deletes every chat in Microsoft 365 Copilot itself, one by one, through each chat's *More > Delete* menu. You have to type `DELETE` to start it, it cannot be undone, and **Stop** halts it after the chat in progress. To check the menu path without deleting anything: `powershell -STA -File bridge.ps1 delete -Id <chat id> -DryRun`.
+- **Delete all chats** (bottom of the sidebar) deletes every chat in Microsoft 365 Copilot itself, one by one, through each chat's *More > Delete* menu. You have to type `DELETE` to start it, it cannot be undone, and **Stop** halts it after the chat in progress. (`remove(id, true)` in `copilot-web.ts` goes as far as the confirmation and answers Cancel, for checking the menu path without deleting anything.)
 
 While a message is being sent, the Copilot window is active for a moment. Don't type during that moment, or a few keystrokes can land in Copilot.
 
@@ -157,7 +157,8 @@ Handy `github` calls Copilot can make:
 | `maxSteps` | `40` | Tool steps per task before it stops |
 | `maxResult` | `8000` | Characters of tool output sent back to Copilot |
 | `pythonIndexUrl` | `""` | Your organization's Python package index (Artifactory or Nexus PyPI mirror) for the setup and `install_package`; empty = PyPI (or pip's own settings). Set it with `--index-url` (see [Install and run](#install-and-run)) |
-| `bridgeScript` | `bridge.ps1` | Another bridge script (relative to the config file), e.g. a fake one for testing without Copilot |
+| `copilotUrl` | `https://m365.cloud.microsoft/chat` | The Microsoft 365 Copilot chat page the engine opens |
+| `bridgeScript` | `""` | A fake Copilot for testing (relative to the config file): a PowerShell script that answers `list` / `read` / `open` / `ask` / `delete` with one JSON line |
 
 To run a second copy with other settings, point `M365_AGENT_CONFIG` at another config file; its `approvals.json` is kept next to that file.
 
@@ -167,13 +168,13 @@ To run a second copy with other settings, point `M365_AGENT_CONFIG` at another c
 - Whatever the agent reads goes into your Copilot chat, which lives in Microsoft's cloud under your account. Sensitive files (`.env`, keys, certificates, `.ssh`, `.aws`, credential and password files, browser login stores) always ask, even inside a trusted folder, and **Always allow** then covers only that one file. Allow them only when the task really needs it.
 - Packages are installed by name only (PyPI, npm, or an exact winget id; no URLs, paths or options). Check the name before you allow it: a typo can install a different package. A winget install puts a program on your PC and accepts its license terms; npm install scripts run.
 - The server only listens on 127.0.0.1 and refuses POST requests from other web pages.
-- Your clipboard is used to paste messages. Its **text** is put back afterwards; images or files on the clipboard are lost.
+- The Copilot window has its own profile (`.copilot-web-profile`, not in git): it is signed in to your Microsoft 365 account, so keep the folder private.
 
 ## Limitations
 
-- It depends on the Copilot app's current layout. An app update that renames things like the chat box can break it until `bridge.ps1` is updated.
-- One message at a time, since it drives a single Copilot window.
-- Very long chats are read by scrolling through them, which takes a few seconds. Long messages that Copilot shows collapsed ("See more") can come back shortened.
+- It depends on the Copilot website's current layout (the chat box id, the "Copy Response" button, the sidebar links). A site update that renames them can break it until `copilot-web.ts` is updated.
+- One message at a time, since it drives a single Copilot page.
+- Very long chats are read by scrolling through them, which takes a few seconds. 
 - Copilot's usage limits and notices still apply; when Copilot shows one, the app shows it as an error.
 - The `screen` tool can only bring windows to the front, not activate them (Windows keeps that for you). A Store app it starts (Calculator, ...) can stay on its splash screen until you click it once; regular apps like Postman draw right away.
 - Red boxes need the text to be on screen and readable: scrolled-away, cut-off or very faint text, and text inside selections, may not be found (the result then says "NOT boxed"). Braces and other lines without letters or digits are not looked for, so a JSON payload's box goes around its fields.
@@ -183,23 +184,22 @@ To run a second copy with other settings, point `M365_AGENT_CONFIG` at another c
 
 | Problem | Fix |
 |---|---|
-| `Microsoft 365 Copilot app did not open …` / `… opened, but its chat screen did not appear …` / `… is not installed …` | Run `npm run diag` in this folder (or `powershell -STA -ExecutionPolicy Bypass -File bridge.ps1 diag`). It lists the Copilot apps and packages on the PC, starts the app, waits for its window and chat screen, and shows what it found (window, page, control ids, sign-in texts). The same text is saved in `diag.txt`: send that or a screenshot of it. Often the fix is to open the app once by hand, sign in with the work account and close it. |
-| `chat box not found` | Open the Copilot app once, make sure it is signed in and shows a chat. |
+| `Microsoft 365 Copilot wants you to sign in …` | Sign in in the Copilot window that came up (work account), then press **Sync**. |
+| `the Copilot chat box did not appear …` | Look at the Copilot window: a notice, a consent page or an error page stops it. Fix it there, then press **Sync**. |
+| `could not start Edge for Copilot` | Check that Edge is installed and that no other copy of this server is running (one Copilot window per profile). |
 | `Copilot: You've reached your daily limit` | Wait for the time shown, or sign in with your work account. |
-| `could not start a new chat in Copilot` / `New chat button not found` | Restore the Copilot window once and expand its sidebar, then minimize it again. |
-| `the message did not reach Copilot` | Close any dialog open in the Copilot app. |
+| `could not start a new chat in Copilot` / `the message did not reach Copilot` | Look at the Copilot window for a dialog or notice and close it; nothing was sent, so just send again. |
 | `the Python tools are not installed` | Run `npm run setup`. |
 | The browser tool can't start | Check that Edge is installed (or set `"browser": "chrome"` in `config.json`); close a stuck agent browser window and try again. |
-| Delete all stops with `no Delete button in the confirmation (…)` | Copilot changed its "Delete chat?" dialog. The error lists the buttons it found; update the names in the `delete` command of `bridge.ps1`. |
+| Delete stops with `the chat menu has no Delete item, or its confirmation did not open` | Copilot changed its chat menu or its "Delete chat?" dialog; update `remove` in `copilot-web.ts`. |
 | Delete stops with `Copilot put chat … back` | Copilot's server refused the delete; try again later, one chat at a time. |
-| Delete all stops with `could not put focus on the Delete button` or `still in the sidebar` | Run `bridge.ps1 delete -Id <id> -DryRun` to see which step fails; it answers Cancel, so nothing is deleted. |
 | The `github` tool says gh is not installed | `winget install --id GitHub.cli`, then `gh auth login`, then restart the server. |
 
 ## Project layout
 
 ```
 server.ts            web server, chat sync and the agent loop
-bridge.ps1           Windows UI Automation for the Copilot app
+copilot-web.ts       Microsoft 365 Copilot in its own Edge window (playwright-core): chats, messages, replies
 index.html           the web app
 tools/               one file per tool; _lib.ts has shared helpers, _template.ts is a starting point
 tools/py/            Python scripts behind make_docx and make_pptx (run in .venv)

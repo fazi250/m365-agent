@@ -1,5 +1,5 @@
-// M365 Agent: a local web app (http://127.0.0.1:4317) that uses the Microsoft 365 Copilot desktop app, running
-// minimized in the background, as its chat and planning engine.
+// M365 Agent: a local web app (http://127.0.0.1:4317) that uses Microsoft 365 Copilot (the website, in its own
+// minimized Edge window: see copilot-web.ts) as its chat and planning engine.
 //
 //   chats   the Copilot sidebar is synced here; open one to see its messages and keep talking in it
 //   tools   tick tools for a chat and your message becomes a task: Copilot answers with one JSON tool call per turn,
@@ -16,14 +16,16 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renam
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stopProcesses, type Tool, type ToolContext } from "./tools/_lib.ts";
+import { CopilotWeb } from "./copilot-web.ts";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
 // ── config: config.json (or the file in M365_AGENT_CONFIG) over these defaults ──
-// bridgeScript replaces bridge.ps1, e.g. with a fake one for testing without Copilot.
+// bridgeScript: a fake Copilot for testing (a PowerShell script answering list / read / open / ask / delete with one
+// JSON line), used instead of the website.
 const defaults = {
   port: 4317, workspace: "workspace", projects: [] as string[], readRoots: [] as string[], maxSteps: 40, maxResult: 8000,
-  bridgeScript: "", browser: "msedge", pythonIndexUrl: "",
+  bridgeScript: "", browser: "msedge", pythonIndexUrl: "", copilotUrl: "https://m365.cloud.microsoft/chat",
 };
 const configFile = process.env.M365_AGENT_CONFIG ? path.resolve(process.env.M365_AGENT_CONFIG) : path.join(ROOT, "config.json");
 const config = { ...defaults, ...(existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {}) };
@@ -63,7 +65,8 @@ const ctx: ToolContext = {
   browserChannel: config.browser,
   trackWrite: (full) => trackWrite(full),
 };
-const BRIDGE = config.bridgeScript ? path.resolve(path.dirname(configFile), config.bridgeScript) : path.join(ROOT, "bridge.ps1");
+const FAKE_BRIDGE = config.bridgeScript ? path.resolve(path.dirname(configFile), config.bridgeScript) : "";
+const copilot = new CopilotWeb({ root: ROOT, url: config.copilotUrl, channel: config.browser });
 
 // ── tools: every tools/*.ts except _*.ts ──
 const tools = new Map<string, Tool>();
@@ -94,50 +97,59 @@ function emit(ev: Record<string, unknown>) {
   for (const c of clients) c.write(line);
 }
 
-// ── Copilot bridge: one PowerShell call at a time, since it drives a single window ──
+// ── Copilot: one command at a time, since it is one page ──
 type Chat = { id: string; title: string };
 type Msg = { role: "user" | "copilot"; text: string };
-type BridgeResult = { ok: boolean; error?: string; text?: string; chats?: Chat[]; messages?: Msg[]; prev?: number; closed?: boolean };
+type BridgeResult = { ok: boolean; error?: string; text?: string; chatId?: string; chats?: Chat[]; messages?: Msg[]; closed?: boolean };
+type BridgeCmd = "list" | "read" | "open" | "ask" | "delete";
+type BridgeOpts = { input?: string; newChat?: boolean; id?: string; noLaunch?: boolean };
 
 let bridgeQueue: Promise<unknown> = Promise.resolve();
-let userWindow = 0; // your window, reported by the bridge; focus goes back there after each step
-function bridge(cmd: "list" | "read" | "open" | "ask" | "delete", opts: { input?: string; newChat?: boolean; id?: string; noLaunch?: boolean } = {}): Promise<BridgeResult> {
-  const run = () =>
-    new Promise<BridgeResult>((resolve) => {
-      const args = ["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", BRIDGE, cmd];
-      if (opts.newChat) args.push("-New");
-      if (opts.id) args.push("-Id", opts.id);
-      if (opts.noLaunch) args.push("-NoLaunch");
-      if (userWindow) args.push("-Prev", String(userWindow));
-      const ps = spawn("powershell", args, { windowsHide: true });
-      let out = "";
-      ps.stdout.on("data", (d) => (out += d));
-      ps.stderr.on("data", (d) => (out += d));
-      const started = Date.now();
-      ps.on("close", () => {
-        const line = out.trim().split(/\r?\n/).filter((l) => l.startsWith("{")).at(-1);
-        let r: BridgeResult;
-        try {
-          r = JSON.parse(line ?? "");
-          if (r.prev) userWindow = r.prev;
-        } catch {
-          r = { ok: false, error: out.trim().slice(0, 500) || "bridge gave no output" };
-        }
-        log(`bridge ${cmd}${opts.id ? ` ${opts.id}` : ""}${opts.newChat ? " -New" : ""} ${Date.now() - started}ms -> ${r.ok ? "ok" : `ERROR ${r.error}`}`);
-        resolve(r);
-      });
-      ps.stdin.end(opts.input ?? "", "utf8");
-    });
+function bridge(cmd: BridgeCmd, opts: BridgeOpts = {}): Promise<BridgeResult> {
+  const run = async (): Promise<BridgeResult> => {
+    const started = Date.now();
+    let r: BridgeResult;
+    try {
+      r = FAKE_BRIDGE ? await fakeBridge(cmd, opts)
+        : cmd === "list" ? await copilot.list(opts.noLaunch)
+        : cmd === "read" ? await copilot.read()
+        : cmd === "open" ? await copilot.open(String(opts.id))
+        : cmd === "ask" ? await copilot.ask(opts.input ?? "", !!opts.newChat)
+        : await copilot.remove(String(opts.id));
+    } catch (e) {
+      r = { ok: false, error: (e instanceof Error ? e.message : String(e)).split("\n")[0] };
+    }
+    log(`copilot ${cmd}${opts.id ? ` ${opts.id}` : ""}${opts.newChat ? " -New" : ""} ${Date.now() - started}ms -> ${r.ok ? "ok" : `ERROR ${r.error}`}`);
+    return r;
+  };
   const p = bridgeQueue.then(run, run);
   bridgeQueue = p;
   return p;
 }
 
-// Sends a message. When the bridge stopped before typing anything ("nothing was typed": Copilot could not be made
-// active, or its chat box would not take focus), trying once more is safe.
+// the fake Copilot for tests (config bridgeScript): one PowerShell call per command, the message on stdin
+function fakeBridge(cmd: BridgeCmd, opts: BridgeOpts): Promise<BridgeResult> {
+  return new Promise((resolve) => {
+    const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", FAKE_BRIDGE, cmd];
+    if (opts.newChat) args.push("-New");
+    if (opts.id) args.push("-Id", opts.id);
+    if (opts.noLaunch) args.push("-NoLaunch");
+    const ps = spawn("powershell", args, { windowsHide: true });
+    let out = "";
+    ps.stdout.on("data", (d) => (out += d));
+    ps.stderr.on("data", (d) => (out += d));
+    ps.on("close", () => {
+      const line = out.trim().split(/\r?\n/).filter((l) => l.startsWith("{")).at(-1);
+      try { resolve(JSON.parse(line ?? "")); } catch { resolve({ ok: false, error: out.trim().slice(0, 500) || "fake bridge gave no output" }); }
+    });
+    ps.stdin.end(opts.input ?? "", "utf8");
+  });
+}
+
+// Sends a message. When nothing was sent (the chat box or a new chat wasn't ready), trying once more is safe.
 async function askCopilot(input: string, newChat: boolean): Promise<BridgeResult> {
   const r = await bridge("ask", { input, newChat });
-  if (r.ok || !/nothing was typed/.test(String(r.error))) return r;
+  if (r.ok || !/nothing was sent/.test(String(r.error))) return r;
   await new Promise((res) => setTimeout(res, 1500));
   return bridge("ask", { input, newChat });
 }
@@ -147,8 +159,8 @@ let chats: Chat[] = [];
 let currentChat: string | null = null; // the chat open in Copilot, as far as this server knows
 let busy = false;
 
-// background: the timer's sync. It never starts the Copilot app: if you closed it, it stays closed until you send a
-// message, open a chat or press Sync.
+// background: the timer's sync. It never opens the Copilot window: if you closed it, it stays closed until you send
+// a message, open a chat or press Sync.
 async function refreshChats(background = false): Promise<void> {
   const r = await bridge("list", { noLaunch: background });
   if (!r.ok) return emit({ type: "error", text: `could not read Copilot chats: ${r.error}` });
@@ -388,6 +400,13 @@ async function send(chatId: string | null, message: string, toolNames: string[])
   taskGrants.clear(); // "Allow for this task" ends with the task
   emit({ type: "busy" });
   emit({ type: "user", text: message });
+  // the chat a new conversation got in Copilot (its id comes with the first reply; the sidebar can lag behind)
+  let startedId: string | undefined;
+  const ask = async (text: string, fresh: boolean) => {
+    const r = await askCopilot(text, fresh);
+    if (fresh && r.ok && r.chatId) startedId = r.chatId;
+    return r;
+  };
   try {
     const newChat = !chatId;
     if (chatId && chatId !== currentChat) {
@@ -400,7 +419,7 @@ async function send(chatId: string | null, message: string, toolNames: string[])
 
     if (!selected.length) {
       emit({ type: "status", text: "waiting for Copilot…" });
-      const r = await askCopilot(message, newChat);
+      const r = await ask(message, newChat);
       if (!r.ok) return emit({ type: "error", text: String(r.error) });
       emit({ type: "reply", text: r.text ?? "" });
     } else {
@@ -408,7 +427,7 @@ async function send(chatId: string | null, message: string, toolNames: string[])
       let badCalls = 0, toolRuns = 0, verifyAsked = false;
       for (let step = 1; step <= config.maxSteps && !stopRequested; step++) {
         emit({ type: "status", text: `step ${step}: waiting for Copilot…` });
-        const r = await askCopilot(out, newChat && step === 1);
+        const r = await ask(out, newChat && step === 1);
         if (!r.ok) return emit({ type: "error", text: String(r.error) });
         const reply = r.text ?? "";
         const call = parseCall(reply);
@@ -463,7 +482,12 @@ async function send(chatId: string | null, message: string, toolNames: string[])
   } finally {
     const known = new Set(chats.map((c) => c.id));
     await refreshChats(); // order (and a new chat's title) changed
-    const created = chatId ? undefined : chats.find((c) => !known.has(c.id)); // the chat this message started, if any
+    // the chat this message started, if any
+    const created = chatId ? undefined : startedId ? { id: startedId, title: message.slice(0, 60) } : chats.find((c) => !known.has(c.id));
+    if (created && !chats.some((c) => c.id === created.id)) { // not in the sidebar yet: show it until the next sync
+      chats = [created, ...chats];
+      emit({ type: "chats", chats });
+    }
     if (created) {
       currentChat = created.id;
       emit({ type: "created", id: created.id });
@@ -473,10 +497,6 @@ async function send(chatId: string | null, message: string, toolNames: string[])
   }
 }
 
-// The page asks for confirmation in a browser dialog; right after you click OK the browser takes keyboard focus back,
-// which would steal the keystrokes meant for Copilot. Give it a moment first.
-const settleBrowser = () => new Promise((ok) => setTimeout(ok, 1500));
-
 // ── delete every chat in Copilot, one by one (the sidebar can load more as it empties) ──
 async function deleteAll() {
   busy = true;
@@ -484,7 +504,6 @@ async function deleteAll() {
   emit({ type: "busy" });
   let deleted = 0, error = "";
   try {
-    await settleBrowser();
     for (let round = 0; round < 50 && !stopRequested && !error; round++) {
       await refreshChats();
       if (!chats.length) break;
@@ -589,7 +608,6 @@ http
       busy = true;
       emit({ type: "busy" });
       try {
-        await settleBrowser();
         const r = await bridge("delete", { id });
         if (!r.ok) return json(res, 500, { error: r.error });
         if (currentChat === id) currentChat = null;

@@ -1,9 +1,9 @@
 node_modules/
 .venv/
 .browser-profile*/
+.copilot-web-profile/
 workspace/
 config.json
 approvals.json
 *.log
 __pycache__/
-diag.txt

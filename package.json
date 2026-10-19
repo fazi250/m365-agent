@@ -2,7 +2,7 @@
   "name": "m365-agent",
   "version": "0.2.0",
   "private": true,
-  "description": "Local web app that uses the Microsoft 365 Copilot desktop app (running minimized) as a chat and agent engine, with pluggable local tools.",
+  "description": "Local web app that uses Microsoft 365 Copilot (its website, in its own minimized Edge window) as a chat and agent engine, with pluggable local tools.",
   "type": "module",
   "engines": {
     "node": ">=23.6"
@@ -12,8 +12,7 @@
   ],
   "scripts": {
     "setup": "powershell -ExecutionPolicy Bypass -File setup.ps1",
-    "start": "node server.ts",
-    "diag": "powershell -NoProfile -STA -ExecutionPolicy Bypass -File bridge.ps1 diag"
+    "start": "node server.ts"
   },
   "dependencies": {
     "playwright-core": "^1.56.0"
