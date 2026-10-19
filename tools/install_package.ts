@@ -88,7 +88,8 @@ const tool: Tool = {
     if (!existsSync(ctx.python)) return "the venv is missing: ask the user to run setup.ps1";
     // your organization's PyPI mirror (pythonIndexUrl in config.json), when you set one
     const index = ctx.pythonIndexUrl ? ["--index-url", ctx.pythonIndexUrl] : [];
-    const viaUv = await runProcess("uv", ["pip", "install", "--python", ctx.python, ...index, ...pkgs], { cwd: ctx.root, timeoutMs: 300_000 });
+    // --native-tls: the Windows certificate store, which holds a company proxy's root certificate (see setup.ps1)
+    const viaUv = await runProcess("uv", ["pip", "install", "--native-tls", "--python", ctx.python, ...index, ...pkgs], { cwd: ctx.root, timeoutMs: 300_000 });
     const out = viaUv.includes("[not found: uv]")
       ? await runProcess(ctx.python, ["-m", "pip", "install", ...index, ...pkgs], { cwd: ctx.root, timeoutMs: 300_000 })
       : viaUv;

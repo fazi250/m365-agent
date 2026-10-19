@@ -110,10 +110,15 @@ function Find-ByName($root, $name, $type) {
 }
 
 # ── window and focus ──
-# The app's main window. Its program is M365Copilot.exe; in case another build of the app (package
-# Microsoft.MicrosoftOfficeHub) names it differently, any program with a window from that package counts too.
+# The app's main window. Its program is M365Copilot.exe (Store build, in WindowsApps). Newer builds, seen on work
+# PCs, are named just "Copilot" in the Start menu and run copilotapp.exe from Program Files\Microsoft\Copilot (the
+# OfficeHub app id starts it). In case a build names it differently again, any program with a window from the
+# Microsoft.MicrosoftOfficeHub package counts too.
 function Get-MainHandle {
   $p = Get-Process M365Copilot -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0 | Select-Object -First 1
+  if (-not $p) {
+    $p = Get-Process copilotapp -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $_.Path -like "*\Microsoft\Copilot\Application\copilotapp.exe" } | Select-Object -First 1
+  }
   if (-not $p) {
     $p = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $_.Path -like "*\WindowsApps\Microsoft.MicrosoftOfficeHub_*" } | Select-Object -First 1
   }
@@ -181,7 +186,7 @@ function Diagnose {
     Windowed
   }
   if ($h -eq [IntPtr]::Zero) {
-    Say "== RESULT: no window from M365Copilot.exe or the Microsoft.MicrosoftOfficeHub package"
+    Say "== RESULT: no window from M365Copilot.exe, copilotapp.exe or the Microsoft.MicrosoftOfficeHub package"
   } else {
     $root = $AE::FromHandle($h)
     Say "== Copilot window: '$($root.Current.Name)', class $($root.Current.ClassName), minimized: $([W]::IsIconic($h))"

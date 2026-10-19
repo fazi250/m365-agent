@@ -30,7 +30,7 @@ No API keys and no GPU: it reuses the Copilot app you are already signed in to.
 ## Requirements
 
 - Windows 10 or 11
-- **Microsoft 365 Copilot** app (from the Microsoft Store), signed in. Use your **work account** if your organization's Copilot licence is the one you want: personal accounts have a daily usage limit.
+- **Microsoft 365 Copilot** app (from the Microsoft Store), signed in. Use your **work account** if your organization's Copilot licence is the one you want: personal accounts have a daily usage limit. On some work PCs the same app is called just **Copilot** in the Start menu and runs `copilotapp.exe` from `Program Files (x86)\Microsoft\Copilot`; the bridge finds that one too.
 - **Node.js 23.6 or newer** (Node 24 LTS recommended). It runs the TypeScript files directly. Check with `node -v`.
 - **Microsoft Edge** (or Google Chrome, see `browser` below) for the `browser` tool; the installed browser is used, nothing is downloaded.
 - **Python 3.10 or newer** for the document tools (`uv` is used when installed, otherwise `python -m venv`).
@@ -56,7 +56,7 @@ On a company PC where PyPI is blocked and Python packages come from your organiz
 npm run setup -- --index-url https://artifactory.example.com/api/pypi/pypi/simple
 ```
 
-`npm start -- --index-url <url>`, `npm start --index-url=<url>` and `start.cmd --index-url <url>` work too. A URL with a user name and token in it is shown with the token hidden; `config.json` stays out of git.
+`npm start -- --index-url <url>`, `npm start --index-url=<url>` and `start.cmd --index-url <url>` work too. A URL with a user name and token in it is shown with the token hidden; `config.json` stays out of git. `uv` is run with `--native-tls`, so it trusts the Windows certificate store: a company proxy that replaces certificates with its own (its root certificate is installed in Windows) doesn't cause certificate errors.
 
 ```
 npm start

@@ -31,8 +31,10 @@ if ($LASTEXITCODE) { throw "npm install failed" }
 
 Write-Host "== Python venv in .venv"
 if (Get-Command uv -ErrorAction SilentlyContinue) {
-  if (-not (Test-Path .venv)) { uv venv .venv }
-  uv pip install --python .venv\Scripts\python.exe @indexArgs -r requirements.txt
+  # --native-tls: trust the Windows certificate store, where company proxies put their own root certificate
+  # (uv's bundled roots don't have it, so downloads fail with a certificate error behind such a proxy)
+  if (-not (Test-Path .venv)) { uv venv --native-tls .venv }
+  uv pip install --native-tls --python .venv\Scripts\python.exe @indexArgs -r requirements.txt
 } else {
   if (-not (Test-Path .venv)) { python -m venv .venv }
   .venv\Scripts\python.exe -m pip install @indexArgs -r requirements.txt
