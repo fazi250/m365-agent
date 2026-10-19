@@ -182,6 +182,16 @@ To run a second copy with other settings, point `M365_AGENT_CONFIG` at another c
 
 ## Troubleshooting
 
+When something doesn't work, run this in the m365-agent folder (with the server running or not):
+
+```
+npm run diag
+```
+
+It writes one report, `diag.txt`: the code's commit, Windows / Node / playwright-core / Python versions, the config (tokens hidden), the server's state, Copilot checked step by step (Edge started, the sign-in pages on the way, chat box, sidebar, the open chat's last message and whether it has its Copy Response button, Copilot's notices), the end of `agent.log`, and the newest automatic capture. It also saves a screenshot of the Copilot page, `diag.png`. `npm run diag -- --ask` also sends one test message in a new chat and times the reply. The report names no chats and quotes no messages.
+
+Besides, the server keeps a trace in `agent.log` (every task, Copilot command with its time, tool call with its result, error shown in the page, crash) and, after every failed Copilot command, saves the page's state and a screenshot in `diag/` (the newest 15). Send `diag.txt` and the pictures to whoever helps you.
+
 | Problem | Fix |
 |---|---|
 | `Microsoft 365 Copilot wants you to sign in …` | Sign in in the Copilot window that came up (work account), then press **Sync**. |
@@ -200,6 +210,7 @@ To run a second copy with other settings, point `M365_AGENT_CONFIG` at another c
 ```
 server.ts            web server, chat sync and the agent loop
 copilot-web.ts       Microsoft 365 Copilot in its own Edge window (playwright-core): chats, messages, replies
+diag.ts              npm run diag: the troubleshooting report (diag.txt, diag.png)
 index.html           the web app
 tools/               one file per tool; _lib.ts has shared helpers, _template.ts is a starting point
 tools/py/            Python scripts behind make_docx and make_pptx (run in .venv)
@@ -208,6 +219,7 @@ setup.ps1            npm install + Python venv + config.json
 requirements.txt     Python packages for the venv (install_package adds to it)
 config.example.json  copied to config.json by setup
 start.cmd            starts the server and opens the page
+agent.log, diag/     the server's trace and its captures after failed Copilot commands (not in git)
 workspace/           everything the agent creates (not in git)
 approvals.json       your "Always allow" list (created on first use, not in git)
 ```

@@ -8,3 +8,6 @@ config.json
 approvals.json
 *.log
 __pycache__/
+diag.txt
+diag.png
+diag/

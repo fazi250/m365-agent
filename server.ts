@@ -81,7 +81,8 @@ function approvalLabel(t: Tool): string {
   try { return t.needsApproval({}, ctx) ? "asks first" : "runs on its own"; } catch { return "asks first"; }
 }
 
-// ── agent.log: one line per Copilot step and per error, to see afterwards what went wrong ──
+// ── agent.log: a trace of every task, Copilot command, tool call and error, to see afterwards what went wrong
+//    (npm run diag shows its end). Messages are cut to their start; file contents are not logged. ──
 const LOG_FILE = path.join(ROOT, "agent.log");
 function log(line: string) {
   try {
@@ -89,12 +90,33 @@ function log(line: string) {
     appendFileSync(LOG_FILE, `${new Date().toISOString()} ${line}\n`, "utf8");
   } catch { /* logging must never break the app */ }
 }
+const short = (s: unknown, n = 120) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+function tail(file: string, n: number): string[] {
+  try { return readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean).slice(-n); } catch { return []; }
+}
+process.on("uncaughtException", (e) => { log(`CRASH ${e instanceof Error ? e.stack : e}`); console.error(e); process.exit(1); });
+process.on("unhandledRejection", (e) => { log(`UNHANDLED ${e instanceof Error ? e.stack : e}`); console.error(e); });
 
 // ── server-sent events to the page ──
 const clients = new Set<http.ServerResponse>();
 function emit(ev: Record<string, unknown>) {
+  if (ev.type === "error") log(`page shows error: ${short(ev.text, 400)}`);
   const line = `data: ${JSON.stringify(ev)}\n\n`;
   for (const c of clients) c.write(line);
+}
+
+// ── after a failed Copilot command: the page's state, a screenshot and the log's end, in diag/ (newest 15 kept) ──
+const DIAG_DIR = path.join(ROOT, "diag");
+async function captureFailure(cmd: string, error: string) {
+  try {
+    mkdirSync(DIAG_DIR, { recursive: true });
+    const base = path.join(DIAG_DIR, `${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}-${cmd}`);
+    const state = await copilot.capture(base + ".png");
+    writeFileSync(base + ".txt", [`copilot ${cmd} failed: ${error}`, ...state, "", "== agent.log, last 30 lines", ...tail(LOG_FILE, 30)].join("\n") + "\n", "utf8");
+    log(`  captured ${path.relative(ROOT, base)}.txt / .png`);
+    const old = readdirSync(DIAG_DIR).map((f) => f.replace(/\.(txt|png)$/, "")).filter((v, i, a) => a.indexOf(v) === i).sort().slice(0, -15);
+    for (const o of old) for (const ext of [".txt", ".png"]) rmSync(path.join(DIAG_DIR, o + ext), { force: true });
+  } catch { /* a capture must never break the app */ }
 }
 
 // ── Copilot: one command at a time, since it is one page ──
@@ -120,6 +142,7 @@ function bridge(cmd: BridgeCmd, opts: BridgeOpts = {}): Promise<BridgeResult> {
       r = { ok: false, error: (e instanceof Error ? e.message : String(e)).split("\n")[0] };
     }
     log(`copilot ${cmd}${opts.id ? ` ${opts.id}` : ""}${opts.newChat ? " -New" : ""} ${Date.now() - started}ms -> ${r.ok ? "ok" : `ERROR ${r.error}`}`);
+    if (!r.ok && !FAKE_BRIDGE) await captureFailure(cmd, String(r.error));
     return r;
   };
   const p = bridgeQueue.then(run, run);
@@ -400,6 +423,7 @@ async function send(chatId: string | null, message: string, toolNames: string[])
   taskGrants.clear(); // "Allow for this task" ends with the task
   emit({ type: "busy" });
   emit({ type: "user", text: message });
+  log(`task: ${chatId ? `chat ${chatId}` : "new chat"}, tools: ${toolNames.join(",") || "none (chat mode)"}: "${short(message, 80)}"`);
   // the chat a new conversation got in Copilot (its id comes with the first reply; the sidebar can lag behind)
   let startedId: string | undefined;
   const ask = async (text: string, fresh: boolean) => {
@@ -422,6 +446,7 @@ async function send(chatId: string | null, message: string, toolNames: string[])
       const r = await ask(message, newChat);
       if (!r.ok) return emit({ type: "error", text: String(r.error) });
       emit({ type: "reply", text: r.text ?? "" });
+      log(`task end: reply (${(r.text ?? "").length} characters)`);
     } else {
       let out = agentPrompt(selected, message);
       let badCalls = 0, toolRuns = 0, verifyAsked = false;
@@ -434,7 +459,8 @@ async function send(chatId: string | null, message: string, toolNames: string[])
         if (!call) {
           // plain text is an answer (a question, an explanation, or Copilot's own wrap-up), like a chat reply;
           // a reply that tried to be a tool call but isn't valid JSON gets one more chance (twice at most)
-          if (!/"tool"\s*:/.test(reply) || ++badCalls > 2) return emit({ type: "reply", text: reply });
+          if (!/"tool"\s*:/.test(reply) || ++badCalls > 2) { log(`task end: plain reply (${reply.length} characters)`); return emit({ type: "reply", text: reply }); }
+          log(`  not a valid tool call (${lastParseError}): "${short(reply, 160)}"`);
           emit({ type: "status", text: `not a valid tool call (${lastParseError}); asking Copilot again` });
           out = `${MARK} Your reply was not one valid JSON tool call (${lastParseError}). Reply with ONLY {"tool": ..., "args": {...}, "why": ...}. Write Windows paths with forward slashes.`;
           continue;
@@ -448,10 +474,12 @@ async function send(chatId: string | null, message: string, toolNames: string[])
             continue;
           }
           const checks = Array.isArray(call.args.checks) ? call.args.checks.map(String) : call.args.checks ? [String(call.args.checks)] : [];
+          log(`task end: done, ${checks.length} checks`);
           return emit({ type: "done", text: String(call.args.answer ?? ""), checks });
         }
         if (call.tool === "ask_user") {
           emit({ type: "call", call });
+          log(`  ask_user: "${short(call.args.question, 100)}"`);
           const answer = await askUser(String(call.args.question ?? call.args.text ?? "").trim() || "(Copilot asked without a question)");
           if (answer === null || stopRequested) break;
           const result = answer.trim() ? `The user answered: ${answer.trim()}` : "The user pressed Continue: the step you asked for is done.";
@@ -467,10 +495,14 @@ async function send(chatId: string | null, message: string, toolNames: string[])
         } else if (await approve(t, call)) {
           emit({ type: "status", text: `step ${step}: running ${t.name}… (Stop ends it)` });
           toolRuns++;
+          const t1 = Date.now();
           try { result = await t.run(call.args, ctx); } catch (e) { result = `error: ${e instanceof Error ? e.message : e}`; }
+          const problem = /^(error|not run|not typed|no |unknown|could not|screen tool failed)/i.test(result) || /\[exit code \d+\]/.test(result);
+          log(`  tool ${call.tool} ${short(JSON.stringify(call.args), 160)} ${Date.now() - t1}ms -> ${problem ? `PROBLEM ${short(result, 240)}` : `ok (${result.length} characters)`}`);
           if (call.tool === "write_file") emitChanges(); // the Keep / Undo list in the page
         } else {
           result = "The user declined to run this. Choose another way or use done.";
+          log(`  tool ${call.tool} declined by the user`);
         }
         if (stopRequested) break;
         if (result.length > config.maxResult) result = result.slice(0, config.maxResult) + `\n…[${result.length - config.maxResult} more characters cut]`;
@@ -662,6 +694,18 @@ http
       resolve(String(text ?? ""));
       return json(res, 204);
     }
+    // npm run diag asks here while the server runs (the Copilot window is this server's). POST, so other web pages
+    // can't trigger it; ask: also one test message in a new chat, only while no task is running.
+    if (req.method === "POST" && url.pathname === "/api/diag") {
+      const { ask } = await readBody(req);
+      if (ask && busy) return json(res, 409, { error: "a task is running: run diag --ask when it is done" });
+      const head = [`server: busy ${busy}, ${chats.length} chats known, open chat ${currentChat ?? "none"}, ${pending.size} approval(s) and ${questions.size} question(s) waiting`];
+      if (FAKE_BRIDGE) return json(res, 200, { lines: [...head, `fake Copilot in use (bridgeScript ${FAKE_BRIDGE})`] });
+      const run = () => copilot.diagnose({ ask: !!ask, screenshot: path.join(ROOT, "diag.png") });
+      const p = bridgeQueue.then(run, run); // between Copilot commands, never in the middle of one
+      bridgeQueue = p.catch(() => {});
+      return json(res, 200, { lines: [...head, ...(await p.catch((e) => [`diag failed: ${e instanceof Error ? e.message : e}`]))] });
+    }
     if (req.method === "POST" && url.pathname === "/api/stop") {
       stopRequested = true;
       for (const [id, resolve] of pending) { resolve("deny"); pending.delete(id); }
@@ -674,6 +718,7 @@ http
   })
   .listen(config.port, "127.0.0.1", () => {
     console.log(`M365 Agent → http://127.0.0.1:${config.port}   tools: ${[...tools.keys()].join(", ")}`);
+    log(`server start: node ${process.version}, port ${config.port}, copilot ${FAKE_BRIDGE ? `FAKE ${FAKE_BRIDGE}` : config.copilotUrl}, browser ${config.browser}`);
     refreshChats();
     setInterval(() => { if (!busy) refreshChats(true); }, 60_000); // keep the sidebar in sync, without reopening Copilot
   });

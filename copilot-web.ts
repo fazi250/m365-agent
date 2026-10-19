@@ -323,6 +323,71 @@ export class CopilotWeb {
     }
   }
 
+  // ── diagnostics. They name no chats and quote no messages (those can hold work data). ──
+
+  // what the Copilot page shows right now, as report lines
+  private async pageState(p: Page): Promise<string[]> {
+    const hostOf = (u: string) => { try { return new URL(u).hostname; } catch { return ""; } };
+    const edge = (await p.evaluate(() => navigator.userAgent).catch(() => "")).match(/Edg\/([\d.]+)/)?.[1] ?? "?";
+    const chats = await this.chats(p).catch(() => []);
+    const msgs = await p.evaluate(readMessages).catch(() => []);
+    const last = msgs.at(-1);
+    return [
+      `page: ${p.url().split("?")[0]} ("${await p.title().catch(() => "")}")${SIGN_IN.test(hostOf(p.url())) ? "  <== a SIGN-IN page" : ""}; Edge ${edge}`,
+      `chat box: ${(await p.locator(EDITOR).count().catch(() => 0)) ? "there" : "NOT there"}; sidebar chats: ${chats.length}; New chat link: ${(await p.getByRole("link", { name: "New chat", exact: true }).count().catch(() => 0)) ? "there" : "NOT there"}`,
+      `open chat: ${msgs.length} messages in the page` + (last ? `; the last is from ${last.role} (#${last.pos || "?"}, ${last.text.length} characters)` +
+        (last.role === "copilot" ? (last.done ? ", with its Copy Response button" : ", WITHOUT a Copy Response button") : "") : ""),
+      `Copilot notices: ${(await this.notice(p)) || "(none)"}`,
+    ];
+  }
+
+  /** after a failed command: the page's state and a screenshot (file), without opening Copilot if it is closed */
+  async capture(file: string): Promise<string[]> {
+    if (!this.isOpen()) return ["the Copilot window is not open"];
+    const p = this.page!;
+    const lines = await this.pageState(p).catch((e) => [`page state unavailable: ${e instanceof Error ? e.message : e}`]);
+    const shot = await p.screenshot({ path: file, timeout: 10_000 }).then(() => `screenshot: ${file}`, () => "no screenshot");
+    return [...lines, shot];
+  }
+
+  /** npm run diag: reaching Copilot step by step; ask: also one test message in a new chat, timed */
+  async diagnose(opts: { ask?: boolean; screenshot?: string } = {}): Promise<string[]> {
+    const out: string[] = [];
+    const say = (s: string) => out.push(s);
+    const why = (e: unknown) => (e instanceof Error ? e.message : String(e)).split("\n")[0];
+    const hostOf = (u: string) => { try { return new URL(u).hostname; } catch { return ""; } };
+    const t0 = Date.now();
+    const secs = (from = t0) => `${((Date.now() - from) / 1000).toFixed(1)} s`;
+    say(`Copilot page ${this.o.url}, browser ${this.o.channel}, profile ${path.join(this.o.root, ".copilot-web-profile")}`);
+    let p: Page;
+    try {
+      const was = this.isOpen();
+      p = await this.start();
+      say(was ? "Edge window: already open" : `Edge window: started in ${secs()}`);
+    } catch (e) {
+      say(`Edge window: FAILED: ${why(e)}`);
+      return out;
+    }
+    const hosts: string[] = [];
+    const onNav = (f: any) => { if (f === p.mainFrame()) { const h = hostOf(f.url()); if (h && hosts.at(-1) !== h) hosts.push(h); } };
+    p.on("framenavigated", onNav);
+    try { await this.ready(); say(`ready: yes (${secs()})`); } catch (e) { say(`ready: NO: ${why(e)}`); }
+    p.off("framenavigated", onNav);
+    if (hosts.length) say(`pages on the way: ${hosts.join(" > ")}`);
+    out.push(...(await this.pageState(p)));
+    if (opts.ask) {
+      const t1 = Date.now();
+      try {
+        const r = await this.ask("Reply with only the word OK.", true);
+        say(`test message in a new chat: reply in ${secs(t1)}: "${String(r.text).slice(0, 40)}"`);
+      } catch (e) { say(`test message: FAILED after ${secs(t1)}: ${why(e)}`); }
+    }
+    if (opts.screenshot) {
+      say(await p.screenshot({ path: opts.screenshot, timeout: 10_000 }).then(() => `screenshot of the Copilot page: ${opts.screenshot}`, (e) => `screenshot failed: ${why(e)}`));
+    }
+    return out;
+  }
+
   async remove(id: string, dryRun = false): Promise<Result> {
     if (!GUID.test(id)) throw new Error(`not a chat id: ${id}`);
     const p = await this.ready();
