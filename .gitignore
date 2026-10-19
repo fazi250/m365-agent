@@ -2,6 +2,7 @@ node_modules/
 .venv/
 .browser-profile*/
 .copilot-web-profile/
+copilot-timeout.png
 workspace/
 config.json
 approvals.json

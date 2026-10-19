@@ -60,7 +60,8 @@ function readMessages() {
     }
     text = text.replace(/^\s*(You|Copilot) said:\s*/, "").replace(/\n{3,}/g, "\n\n").trim();
     const done = !![...a.querySelectorAll("button,[role=button]")].find((b) => b.getAttribute("aria-label") === "Copy Response");
-    return { key: a.getAttribute("aria-posinset") ?? `i${i}`, role, text, done };
+    const pos = Number(a.getAttribute("aria-posinset")) || 0; // the message's number in the whole chat (1, 2, ...)
+    return { key: pos ? String(pos) : `i${i}`, pos, role, text, done };
   }).filter((m) => m.role);
 }
 
@@ -228,9 +229,16 @@ export class CopilotWeb {
       if (await articles.count()) throw new Error("could not start a new chat in Copilot (nothing was sent)");
     }
     const chatsBefore = new Set((await this.chats(p)).map((c) => c.id));
+    // New messages are told apart by their number in the chat (aria-posinset): higher than any before. Counting the
+    // messages in the page is not enough, since Copilot can take messages far above the view out of the page.
     const before = await p.evaluate(readMessages);
-    const userBefore = before.filter((m) => m.role === "user").length;
-    const copilotBefore = before.filter((m) => m.role === "copilot").length;
+    const numbered = before.every((m) => m.pos > 0);
+    const posBefore = Math.max(0, ...before.map((m) => m.pos));
+    const countBefore = { user: before.filter((m) => m.role === "user").length, copilot: before.filter((m) => m.role === "copilot").length };
+    const newOnes = (list: typeof before, role: "user" | "copilot") => {
+      const mine = list.filter((m) => m.role === role);
+      return numbered && mine.every((m) => m.pos > 0) ? mine.filter((m) => m.pos > posBefore) : mine.slice(countBefore[role]);
+    };
 
     // put the message in the chat box as a paste (keeps its line breaks), check it is there, then Enter
     const box = p.locator(EDITOR).first();
@@ -253,31 +261,44 @@ export class CopilotWeb {
       await p.keyboard.press("Enter");
       for (let i = 0; i < 25 && !sent; i++) {
         await p.waitForTimeout(200);
-        sent = (await p.evaluate(readMessages)).filter((m) => m.role === "user").length > userBefore;
+        sent = newOnes(await p.evaluate(readMessages), "user").length > 0;
       }
     }
     if (!sent) throw new Error("the message did not reach Copilot (nothing was sent; is a dialog open in the Copilot window?)");
 
     // done = the new reply has its "Copy Response" button and its text stopped changing. A notice that never gets
     // that button is taken once unchanged for 30 s, unless it is a progress line ("Lining things up...").
-    const deadline = Date.now() + (this.o.replyTimeoutSec ?? 240) * 1000;
-    let last = "", stable = 0;
+    const timeout = this.o.replyTimeoutSec ?? 240;
+    const deadline = Date.now() + timeout * 1000;
+    let last = "", stable = 0, seen: { text: string; done: boolean } | null = null, notice = "";
     while (Date.now() < deadline) {
       await p.waitForTimeout(700);
-      const notice = await this.notice(p);
+      notice = await this.notice(p);
       if (/limit/i.test(notice)) throw new Error(`Copilot: ${notice}`);
-      const replies = (await p.evaluate(readMessages)).filter((m) => m.role === "copilot");
-      if (replies.length <= copilotBefore) continue;
-      const r = replies[replies.length - 1];
+      const r = newOnes(await p.evaluate(readMessages), "copilot").at(-1);
+      if (!r) continue;
       if (r.done) await this.showCode(p); // Markdown / HTML blocks open as a preview: switch them to their code
-      const text = r.done ? ((await p.evaluate(readMessages)).filter((m) => m.role === "copilot").at(-1)?.text ?? r.text) : r.text;
+      const text = r.done ? (newOnes(await p.evaluate(readMessages), "copilot").at(-1)?.text ?? r.text) : r.text;
+      seen = { text, done: r.done };
       stable = text && text === last ? stable + 1 : 0;
       last = text;
       const progress = /(\.\.\.|…)\s*$/.test(text);
       if (progress && stable < 85) continue;
       if ((r.done && stable >= 1) || stable >= 43) return { ok: true, text, chatId: await this.chatIdNow(p, chatsBefore) };
     }
-    throw new Error(`no reply from Copilot within ${this.o.replyTimeoutSec ?? 240} s`);
+    throw new Error(`no reply from Copilot within ${timeout} s (${await this.whatWasThere(p, seen, notice)})`);
+  }
+
+  // for a timeout: what the page showed, and a screenshot of it next to the server (copilot-timeout.png)
+  private async whatWasThere(p: Page, seen: { text: string; done: boolean } | null, notice: string): Promise<string> {
+    const all = await p.evaluate(readMessages).catch(() => []);
+    const parts = [seen
+      ? `its reply so far: "${seen.text.replace(/\s+/g, " ").slice(0, 160)}"${seen.done ? "" : ", without a Copy Response button"}`
+      : `no new reply in the page; it shows ${all.length} messages, the last from ${all.at(-1)?.role ?? "nobody"} (#${all.at(-1)?.pos ?? "-"})`];
+    if (notice) parts.push(`Copilot says: ${notice.slice(0, 200)}`);
+    const file = path.join(this.o.root, "copilot-timeout.png");
+    if (await p.screenshot({ path: file, timeout: 10_000 }).then(() => true, () => false)) parts.push(`screenshot of the Copilot page: ${file}`);
+    return parts.join("; ");
   }
 
   // the open chat's id: from the address, or (a new chat gets its address and sidebar entry a moment after the
