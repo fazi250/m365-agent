@@ -12,8 +12,10 @@
   ],
   "scripts": {
     "setup": "powershell -ExecutionPolicy Bypass -File setup.ps1",
-    "start": "node server.ts",
-    "diag": "node diag.ts"
+    "start": "node --disable-warning=ExperimentalWarning server.ts",
+    "diag": "node diag.ts",
+    "test": "node --test \"tests/**/*.test.mjs\" --test-concurrency=1",
+    "test:unit": "node --test \"tests/unit/*.test.mjs\""
   },
   "dependencies": {
     "playwright-core": "^1.56.0"

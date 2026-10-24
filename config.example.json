@@ -9,5 +9,6 @@
   "maxSteps": 40,
   "maxResult": 8000,
   "pythonIndexUrl": "",
-  "copilotUrl": "https://m365.cloud.microsoft/chat"
+  "copilotUrl": "https://m365.cloud.microsoft/chat",
+  "replyTimeoutSec": 240
 }

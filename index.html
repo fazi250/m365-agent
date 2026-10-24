@@ -60,6 +60,10 @@
   #title { font-size: 15px; font-weight: 600; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .pill { font-size: 12px; padding: 2px 10px; border-radius: 99px; background: var(--mono-bg); color: var(--muted); }
   .pill.busy { color: var(--warn); }
+  .pill.ok { color: var(--ok); } .pill.err { color: var(--err); font-weight: 600; }
+  .label .pill { margin-left: 8px; }
+  .cut-note { font-size: 12px; color: var(--muted); margin-top: 6px; display: flex; gap: 8px; align-items: center; }
+  .cut-note button { padding: 2px 8px; font-size: 12px; }
   #tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .tool { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 99px; padding: 3px 10px; font-size: 13px; cursor: pointer; user-select: none; }
   .tool input { margin: 0; }
@@ -80,6 +84,7 @@
   .change-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; }
   .change-path { flex: 1; min-width: 0; font: 12.5px ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
   .kind { font-size: 11px; border-radius: 99px; padding: 0 7px; border: 1px solid var(--line); color: var(--muted); }
+  .kind.err { color: var(--err); border-color: var(--err); font-weight: 600; }
   .plus { color: var(--ok); font-size: 12px; } .minus { color: var(--err); font-size: 12px; }
   .change-row button { padding: 3px 10px; font-size: 13px; }
   .diff { margin: 0; border-top: 1px solid var(--line); border-radius: 0 0 8px 8px; max-height: 360px; }
@@ -92,7 +97,9 @@
   .msg.you { background: var(--you); align-self: flex-end; max-width: 80%; white-space: pre-wrap; }
   .msg.copilot { white-space: pre-wrap; }
   .msg.done { border-color: var(--ok); white-space: pre-wrap; }
-  .msg.done ul { margin: 6px 0 0; padding-left: 20px; white-space: normal; }
+  .msg.done ul, .msg ul.facts { margin: 6px 0 0; padding-left: 20px; white-space: normal; }
+  ul.facts li { color: var(--text); font-weight: normal; }
+  ul.facts li.problem { color: var(--err); font-weight: 600; }
   .msg.question { border: 2px solid var(--warn); }
   .msg.question .q { white-space: pre-wrap; font-weight: 600; }
   .msg.question input { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
@@ -159,8 +166,8 @@
     </form>
   </main>
 </div>
-<script>
-const MARK = "[local-agent]";
+<script type="module">
+import { MARK, parseCall as parseReply } from "/agent-core.js"; // the server's own parser for Copilot's replies
 const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input");
 let chats = [], viewing = null, busy = false, statusEl = null, rules = [];
@@ -185,31 +192,59 @@ function pre(text) { return el("pre", "", text); }
 function add(node) { log.appendChild(node); log.scrollTop = log.scrollHeight; return node; }
 function msg(cls, text) { return add(el("div", "msg " + cls, text)); }
 
-function parseCall(text) {
-  const s = text.indexOf("{"), e = text.lastIndexOf("}");
-  if (s < 0 || e < s) return null;
-  try { const o = JSON.parse(text.slice(s, e + 1)); return typeof o.tool === "string" ? o : null; }
-  catch { try { const o = JSON.parse(text.slice(s, e + 1).replace(/\\(["\\/bfnrtu]?)/g, (m, c) => c ? m : "\\\\")); return typeof o.tool === "string" ? o : null; } catch { return null; } }
+const parseCall = (text) => parseReply(text, () => undefined).call; // a stored reply's call (file blocks stay out of the card)
+// the file, edits, code or script a call carries in its code block, shown as code under the other arguments
+const BLOCKS = { content: "file content", edits: "edits", code: "code", script: "script" };
+function blockOf(a) {
+  for (const key in BLOCKS) if (a && typeof a[key] === "string") return { key, label: BLOCKS[key] + (a.path || a.name ? ` (${a.path || a.name})` : ""), text: a[key] };
+  return null;
 }
 function argsText(a) {
   if (a == null) return "";
+  const block = blockOf(a);
+  if (block) { a = { ...a }; delete a[block.key]; }
   if (typeof a.command === "string") return a.command + (a.cwd ? `\n(in ${a.cwd})` : "");
   if (Array.isArray(a.args)) return "gh " + a.args.join(" ");
-  if (typeof a.path === "string" && a.content == null) return a.path;
+  if (typeof a.path === "string" && Object.keys(a).length === 1) return a.path;
+  if (block && !Object.keys(a).length) return "";
   return JSON.stringify(a, null, 2);
 }
 function callCard(call) {
   const d = add(el("div", "msg"));
   const head = el("div");
   head.append(el("span", "call-name", call.tool), document.createTextNode(" "), el("span", "why", call.why ? "— " + call.why : ""));
-  d.append(head, pre(argsText(call.args)));
+  d.append(head);
+  const text = argsText(call.args), block = blockOf(call.args);
+  if (text) d.append(pre(text));
+  if (block) d.append(el("div", "label", block.label), pre(block.text));
   return d;
 }
-function resultCard(tool, text) {
+// a tool's result; a command's trailer line ([exit 0, 2.3 s] / [exit code 1, 14.2 s] / killed / stopped) becomes a
+// pill, and a result Copilot saw cut in the middle shows in full, with a note on what Copilot got
+function resultCard(tool, text, ev) {
   const d = add(el("div", "msg"));
-  d.append(el("div", "label", "result · " + tool), pre(text));
+  const label = el("div", "label", "result · " + tool);
+  const end = String(text ?? "").trimEnd().split("\n").at(-1).match(/^\[(exit 0|exit code \d+|killed[^\],]*|stopped[^\],]*)(?:, ([\d.]+ s))?\]$/);
+  if (end) label.append(el("span", "pill " + (end[1] === "exit 0" ? "ok" : "err"), end[1] + (end[2] ? " · " + end[2] : "")));
+  d.append(label, pre(ev?.full ?? text));
+  if (ev?.full) {
+    const total = ev.total ?? ev.full.length;
+    const note = el("div", "cut-note", `${total.toLocaleString()} characters${total > ev.full.length ? ` (the first ${ev.full.length.toLocaleString()} shown here)` : ""}; Copilot saw the first ${ev.head.toLocaleString()} and last ${ev.tail.toLocaleString()} (run #${ev.run}; it can ask for the rest with read_output)`);
+    const copy = el("button", "", "Copy all");
+    copy.onclick = () => navigator.clipboard?.writeText(ev.full).then(() => (copy.textContent = "copied"), () => (copy.textContent = "copy failed"));
+    note.append(copy);
+    d.append(note);
+  }
 }
-function doneCard(text, checks) {
+// what really happened on this PC during the task (the server's ledger), under Copilot's own checks
+function factsList(d, facts, warning) {
+  if (!facts || !facts.length) return;
+  const ul = el("ul", "facts");
+  for (const f of facts) ul.append(el("li", f.problem ? "problem" : "", f.text));
+  d.append(el("div", "label", "Facts (from this PC)"), ul);
+  if (warning) d.append(el("div", "warn-note", "⚠ " + warning));
+}
+function doneCard(text, checks, facts, warning) {
   const d = add(el("div", "msg done"));
   d.append(el("div", "label", "Done"), el("div", "", text));
   if (checks && checks.length) {
@@ -217,6 +252,7 @@ function doneCard(text, checks) {
     for (const c of checks) ul.append(el("li", "", String(c)));
     d.append(el("div", "label", "What Copilot checked"), ul);
   }
+  factsList(d, facts, warning);
 }
 
 // Copilot's ask_user: the task waits until you answer here (Continue with an empty box = "done, go on")
@@ -246,15 +282,16 @@ function questionCard(ev) {
 // a message as stored in Copilot (history) → the same cards the live view shows
 function renderStored(m) {
   if (m.role === "user") {
-    const cut = m.text.indexOf("\n" + MARK + " ");
-    if (cut > 0) { // an agent task: "<task>\n\n[local-agent] instructions…"
-      const d = msg("you", ""); d.append(el("span", "badge", "agent"), document.createTextNode(m.text.slice(0, cut).trim())); return;
-    }
-    if (m.text.startsWith(MARK)) {
+    if (m.text.startsWith(MARK)) { // a server message (a RESULT may itself hold a line starting with the marker)
       const r = m.text.match(/^\[local-agent\] RESULT of (\S+):\s*\n([\s\S]*?)\n\s*Next tool call/);
       if (r) return resultCard(r[1], r[2]);
       if (m.text.startsWith(MARK + " Before you finish")) return msg("status", "(asked Copilot to verify every part of the task before finishing)");
+      if (m.text.startsWith(MARK + " You ended with text")) return msg("status", "(Copilot ended with text instead of done: asked it to finish properly)");
       return msg("status", "(asked Copilot to reply with a tool call)");
+    }
+    const cut = m.text.indexOf("\n" + MARK + " ");
+    if (cut > 0) { // an agent task: "<task>\n\n[local-agent] instructions…"
+      const d = msg("you", ""); d.append(el("span", "badge", "agent"), document.createTextNode(m.text.slice(0, cut).trim())); return;
     }
     return msg("you", m.text);
   }
@@ -352,7 +389,9 @@ function renderChanges(list) {
     const diffBtn = el("button", "", "Diff"), keep = el("button", "", "Keep"), undo = el("button", "", "Undo");
     keep.title = "Keep this change"; undo.title = c.kind === "new" ? "Remove this new file" : "Put the original back";
     row.append(el("span", "kind", c.kind), el("span", "change-path", c.path), el("span", "plus", `+${c.added}`),
-      el("span", "minus", `−${c.removed}`), diffBtn, keep, undo);
+      el("span", "minus", `−${c.removed}`));
+    if (c.check) { const bad = el("span", "kind err", "syntax error"); bad.title = c.check; row.append(bad); }
+    row.append(diffBtn, keep, undo);
     card.append(row);
     diffBtn.onclick = () => toggleDiff(card, c.path);
     keep.onclick = () => post("/api/changes/keep", { path: c.path });
@@ -468,12 +507,14 @@ es.onmessage = (e) => {
       d.append(document.createTextNode(ev.text));
       break;
     }
-    case "reply": clearStatus(); msg("copilot", ev.text); break;
+    case "reply": clearStatus(); factsList(msg("copilot", ev.text), ev.facts); break;
     case "call": clearStatus(); callCard(ev.call); break;
     case "approve": {
       const d = add(el("div", "msg"));
-      d.append(el("div", "label", "Copilot wants to run this. Check it first."), el("div", "call-name", ev.call.tool),
-        pre(ev.call.tool === "write_file" ? ev.call.args.path + "\n\n" + (ev.call.args.content ?? "") : argsText(ev.call.args)));
+      d.append(el("div", "label", "Copilot wants to run this. Check it first."), el("div", "call-name", ev.call.tool));
+      const text = argsText(ev.call.args), block = blockOf(ev.call.args);
+      if (text) d.append(pre(text));
+      if (block) d.append(el("div", "label", block.label), pre(block.text));
       if (ev.warning) d.append(el("div", "warn-note", "⚠ " + ev.warning));
       const row = el("div", "actions");
       const once = el("button", "primary", "Allow once"), always = el("button", "", "Always allow"), deny = el("button", "", "Deny");
@@ -499,11 +540,11 @@ es.onmessage = (e) => {
     case "allowed": msg("status", "Allowed by your rule: " + ev.text); break;
     case "changes": renderChanges(ev.changes); break;
     case "rules": rules = ev.rules; renderRules(); break;
-    case "result": resultCard(ev.tool, ev.text); break;
+    case "result": resultCard(ev.tool, ev.text, ev); break;
     case "question": clearStatus(); questionCard(ev); break;
     case "note": msg("status", ev.text); break;
-    case "done": clearStatus(); doneCard(ev.text, ev.checks); break;
-    case "error": clearStatus(); msg("error", ev.text); break;
+    case "done": clearStatus(); doneCard(ev.text, ev.checks, ev.facts, ev.warning); break;
+    case "error": clearStatus(); factsList(msg("error", ev.text), ev.facts); break;
     case "deleted":
       clearStatus();
       msg(ev.error ? "error" : "status", `Deleted ${ev.count} chat(s) from Copilot.` + (ev.error ? ` Stopped: ${ev.error}` : "") + (ev.left ? ` ${ev.left} left.` : ""));

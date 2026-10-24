@@ -14,7 +14,7 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const ask = process.argv.includes("--ask") || process.env.npm_config_ask === "true";
 const configFile = process.env.M365_AGENT_CONFIG ? path.resolve(process.env.M365_AGENT_CONFIG) : path.join(ROOT, "config.json");
 const config = {
-  port: 4317, browser: "msedge", copilotUrl: "https://m365.cloud.microsoft/chat", pythonIndexUrl: "",
+  port: 4317, browser: "msedge", copilotUrl: "https://m365.cloud.microsoft/chat", pythonIndexUrl: "", replyTimeoutSec: 240,
   ...(existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {}),
 };
 const lines: string[] = [];
@@ -49,7 +49,7 @@ if (fromServer.status === 200) {
   say(`server: running on port ${config.port}, but diag answered ${fromServer.status}: ${fromServer.body.error ?? ""}`);
 } else {
   say(`server: not running on port ${config.port} (${fromServer.body.error}); checking Copilot from here`);
-  const w = new CopilotWeb({ root: ROOT, url: config.copilotUrl, channel: config.browser });
+  const w = new CopilotWeb({ root: ROOT, url: config.copilotUrl, channel: config.browser, replyTimeoutSec: Number(config.replyTimeoutSec) || 240 });
   for (const l of await w.diagnose({ ask, screenshot: path.join(ROOT, "diag.png") })) say(l);
   await w.close();
 }

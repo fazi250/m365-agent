@@ -8,11 +8,29 @@ import { chromium, type BrowserContext, type Locator, type Page } from "playwrig
 
 export type Chat = { id: string; title: string };
 export type Msg = { role: "user" | "copilot"; text: string };
-export type Result = { ok: boolean; error?: string; text?: string; chatId?: string; chats?: Chat[]; messages?: Msg[]; closed?: boolean; gone?: boolean; dryRun?: boolean };
+export type Result = {
+  ok: boolean; error?: string; text?: string; chatId?: string; chats?: Chat[]; messages?: Msg[]; closed?: boolean; gone?: boolean; dryRun?: boolean;
+  via?: "button" | "stable30" | "progress60"; // how a reply was taken as finished (ask): its Copy Response button, or text unchanged for 30 s / 60 s
+};
 
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const EDITOR = "#m365-chat-editor-target-element";
 const SIGN_IN = /(^|\.)(login\.microsoftonline\.com|login\.microsoft\.com|login\.live\.com|account\.live\.com|login\.windows\.net)$/i;
+
+// What the engine looks for in the page, several ways each (the first that matches wins), so a renamed id or label
+// in a Copilot update is one line here. Seen layouts: the 2025 chat (editor id, "Copy Response") and the late-2025
+// "latest Copilot" composer (fai-SendButton, "Add and manage sources").
+const SEL = {
+  editor: ["#m365-chat-editor-target-element", "[role=textbox][contenteditable=true][aria-label*='Message' i]", "[contenteditable=true][data-lexical-editor=true]", "textarea[aria-label*='Message' i]"],
+  send: ["button[aria-label='Send' i]", "button.fai-SendButton", "button[type=submit][aria-label*='send' i]", "button[data-testid*='send' i]"],
+  newChat: ["a[aria-label='New chat' i]", "button[aria-label='New chat' i]", "[role=link][aria-label*='New chat' i]"],
+  article: ["[role=article]"],
+  copyResponse: ["button[aria-label='Copy Response' i]", "button[aria-label='Copy' i]", "[role=button][aria-label='Copy Response' i]"],
+  more: (id: string) => [`[data-chat-history-more-button-conversation-id="${id}"]`, `a[id="${id}"] ~ button[aria-label='More' i]`, `a[id="${id}"] + button`],
+};
+const EDITOR = SEL.editor.join(", ");
+// signing the broken session out brings the real sign-in page back (the chat page itself keeps rendering from its
+// cache with a dead session and never redirects)
+const LOGOUT_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/logout?post_logout_redirect_uri=" + encodeURIComponent("https://m365.cloud.microsoft/chat");
 
 // Copilot's page sometimes has a layer over its controls that makes a normal click wait in vain (seen on the
 // sidebar's More buttons and its menus): a normal click first, then one that skips Playwright's checks, then a plain
@@ -55,11 +73,13 @@ function readMessages() {
         if (code == null) continue;
         const fence = fenceFor(code);
         const block = `\n${fence}\n${code}\n${fence}\n`;
-        text = shown && text.includes(shown) ? text.replace(shown, block) : text + block;
+        // a function replacer: with a string, "$&", "$$" or "$'" inside the code would be taken as replacement patterns
+        text = shown && text.includes(shown) ? text.replace(shown, () => block) : text + block;
       }
     }
     text = text.replace(/^\s*(You|Copilot) said:\s*/, "").replace(/\n{3,}/g, "\n\n").trim();
-    const done = !![...a.querySelectorAll("button,[role=button]")].find((b) => b.getAttribute("aria-label") === "Copy Response");
+    // finished = its Copy button is there ("Copy Response" in the 2025 layout; "Copy" in the latest one)
+    const done = !![...a.querySelectorAll("button,[role=button]")].find((b) => /^copy( response)?$/i.test((b.getAttribute("aria-label") || b.getAttribute("title") || "").trim()));
     const pos = Number(a.getAttribute("aria-posinset")) || 0; // the message's number in the whole chat (1, 2, ...)
     return { key: pos ? String(pos) : `i${i}`, pos, role, text, done };
   }).filter((m) => m.role);
@@ -69,6 +89,10 @@ export class CopilotWeb {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private o: { root: string; url: string; channel: string; replyTimeoutSec?: number };
+  // when the page's silent sign-in (token refresh) was refused: with a dead session the page still renders but
+  // nothing can be sent (the Send button stays disabled) and deletes do not stick
+  private authFails: number[] = [];
+  private authBroken() { const since = Date.now() - 60_000; this.authFails = this.authFails.filter((t) => t > since); return this.authFails.length >= 3; }
 
   constructor(o: { root: string; url: string; channel: string; replyTimeoutSec?: number }) { this.o = o; }
 
@@ -93,7 +117,24 @@ export class CopilotWeb {
       this.context.on("close", () => { this.context = null; this.page = null; });
     }
     this.page = this.context.pages().find((p) => !p.isClosed()) ?? (await this.context.newPage());
+    this.page.on("response", (r) => {
+      if (r.status() >= 400 && /\/oauth2\/v2\.0\/token|login\.live\.com\/oauth20_token/i.test(r.url())) this.authFails.push(Date.now());
+    });
     return this.page;
+  }
+
+  // The session is dead (its sign-in server refuses the token refresh): sign it out so the real sign-in page comes
+  // back, bring the window up and tell the user. Always ends in an error for the current command.
+  private async reauth(p: Page): Promise<never> {
+    this.authFails = [];
+    await this.setWindow("normal");
+    await p.goto(LOGOUT_URL, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+    // Microsoft's sign-out page may ask which account: the signed-in one
+    const tile = p.getByText(/^Signed in$/i).first();
+    if (await tile.waitFor({ timeout: 5000 }).then(() => true, () => false)) await press(tile);
+    await p.waitForTimeout(4000);
+    throw new Error("Microsoft 365 Copilot's sign-in had expired (its sign-in server refused the session, so nothing could be sent). " +
+      "The Copilot window is up: sign in there again, then press Sync");
   }
 
   private async setWindow(state: "minimized" | "normal") {
@@ -121,7 +162,11 @@ export class CopilotWeb {
     const started = Date.now();
     let signInSince = 0;
     while (Date.now() - started < 60_000) {
-      if (await p.locator(EDITOR).count().catch(() => 0)) { await this.setWindow("minimized"); return p; }
+      if (await p.locator(EDITOR).count().catch(() => 0)) {
+        await this.dismissPopups(p);
+        await this.setWindow("minimized");
+        return p;
+      }
       if (SIGN_IN.test(host())) {
         signInSince ||= Date.now();
         if (Date.now() - signInSince > 15_000) {
@@ -143,6 +188,32 @@ export class CopilotWeb {
   private notice(p: Page): Promise<string> {
     return p.evaluate(() => [...document.querySelectorAll("[role=status],[role=alert]")]
       .filter((e) => !e.closest("[role=article]")).map((e) => (e as HTMLElement).innerText.trim()).filter(Boolean).join(" ")).catch(() => "");
+  }
+
+  // Copilot's own pop-ups ("Meet the latest Copilot", an announcement, a survey) sit over the page and swallow every
+  // click underneath (seen: Delete all stopped at the second chat). They are closed through their Close / Not now
+  // button or Escape, never through their call to action (which could move the page to another experience). The
+  // "Delete chat?" confirmation is this app's own and is left alone.
+  private async dismissPopups(p: Page): Promise<string[]> {
+    const closed: string[] = [];
+    for (const d of await p.locator("[role=dialog],[role=alertdialog]").all()) {
+      const text = (await d.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+      if (/Delete chat/i.test(text) || !(await d.isVisible().catch(() => false))) continue;
+      const close = d.getByRole("button", { name: /^(close|dismiss|close dialog)$/i }).first();
+      const soft = d.getByRole("button", { name: /not now|maybe later|skip|got it|no thanks|remind me later|dismiss/i }).first();
+      if (await close.count()) await press(close);
+      else if (await soft.count()) await press(soft);
+      else await p.keyboard.press("Escape");
+      await d.waitFor({ state: "hidden", timeout: 3000 }).catch(() => {});
+      closed.push(text.slice(0, 60));
+    }
+    return closed;
+  }
+
+  // the sidebar reloads for a while after a change ("Getting your chats…"): wait until it has settled
+  private async sidebarSettled(p: Page, timeoutMs = 20_000) {
+    const until = Date.now() + timeoutMs;
+    while (Date.now() < until && /Getting your chats/i.test(await this.notice(p))) await p.waitForTimeout(500);
   }
 
   private chats(p: Page): Promise<Chat[]> {
@@ -217,10 +288,11 @@ export class CopilotWeb {
     if (!message.trim()) throw new Error("empty message");
     const p = await this.ready();
     const articles = p.locator("[role=article]");
+    if (this.authBroken()) await this.reauth(p);
     if (newChat) {
       // a fresh chat, and make sure it really is empty, so the message can never land in the previous one
       for (let attempt = 1; attempt <= 2 && (await articles.count()); attempt++) {
-        const link = p.getByRole("link", { name: "New chat", exact: true }).first();
+        const link = p.locator(SEL.newChat.join(", ")).first();
         if (attempt === 1 && (await link.count())) await press(link);
         else await p.goto(this.o.url, { waitUntil: "domcontentloaded" });
         await p.locator(EDITOR).waitFor({ timeout: 20_000 });
@@ -240,10 +312,16 @@ export class CopilotWeb {
       return numbered && mine.every((m) => m.pos > 0) ? mine.filter((m) => m.pos > posBefore) : mine.slice(countBefore[role]);
     };
 
-    // put the message in the chat box as a paste (keeps its line breaks), check it is there, then Enter
+    // put the message in the chat box as a paste (keeps its line breaks), check it is there, then send it with the
+    // Send button (Enter when there is none)
     const box = p.locator(EDITOR).first();
+    const send = p.locator(SEL.send.join(", ")).first();
+    // enabled, and still the Send button: while Copilot answers, the same button is "Stop generating"
+    const sendEnabled = async () => (await send.count()) > 0 && (await send.isEnabled().catch(() => false)) && (await send.getAttribute("aria-disabled")) !== "true"
+      && !/stop/i.test((await send.getAttribute("aria-label").catch(() => "")) ?? "");
     let sent = false;
     for (let attempt = 1; attempt <= 2 && !sent; attempt++) {
+      if (attempt > 1) await this.dismissPopups(p); // a pop-up may have taken the first attempt's clicks
       await press(box);
       await p.keyboard.press("Control+A");
       await p.keyboard.press("Delete");
@@ -258,16 +336,43 @@ export class CopilotWeb {
         await p.keyboard.insertText(message); // the paste was not taken: type it instead
         await p.waitForTimeout(250);
       }
-      await p.keyboard.press("Enter");
+      // the Send button wakes up once the editor took the text; a button that stays off with text in the box means
+      // the page cannot send at all (a dead session), not that the text is missing
+      let ready = !(await send.count());
+      for (let i = 0; i < 16 && !ready; i++) { ready = await sendEnabled(); if (!ready) await p.waitForTimeout(250); }
+      if (!ready) {
+        if (this.authBroken()) await this.reauth(p);
+        if (attempt === 2) break;
+        continue;
+      }
+      // one plain click only: a second click (press()'s fallbacks) would land on the same button once it has turned
+      // into "Stop generating" and cut Copilot's answer short
+      if (await send.count()) { if (!(await send.click({ timeout: 5000 }).then(() => true, () => false))) await p.keyboard.press("Enter"); }
+      else await p.keyboard.press("Enter");
+      // Sent = the new message shows up in the chat. The page takes the text out of the box the moment it accepts
+      // the message, and can draw it in the chat seconds later when the service is slow: an empty box means sent
+      // (wait longer, never send again); text still in the box means it was not taken (try once more).
+      const boxEmpty = async () => !(await box.innerText().catch(() => "")).replace(/[\s​‌﻿]/g, "");
       for (let i = 0; i < 25 && !sent; i++) {
         await p.waitForTimeout(200);
         sent = newOnes(await p.evaluate(readMessages), "user").length > 0;
       }
+      if (!sent && (await boxEmpty())) {
+        for (let i = 0; i < 100 && !sent; i++) { // up to 20 s more for the chat to show it
+          await p.waitForTimeout(200);
+          sent = newOnes(await p.evaluate(readMessages), "user").length > 0;
+        }
+        if (!sent) sent = true; // taken, not drawn: go on to the reply, which is told by its number anyway
+      }
+      if (!sent && !(await boxEmpty()) && (await send.count()) && (await sendEnabled())) { await p.keyboard.press("Enter"); await p.waitForTimeout(1500); sent = newOnes(await p.evaluate(readMessages), "user").length > 0 || (await boxEmpty()); }
     }
-    if (!sent) throw new Error("the message did not reach Copilot (nothing was sent; is a dialog open in the Copilot window?)");
+    if (!sent) {
+      if (this.authBroken()) await this.reauth(p);
+      throw new Error("the message did not reach Copilot (nothing was sent; the Send button stayed off: is a dialog open in the Copilot window, or does Copilot show a notice?)");
+    }
 
     // done = the new reply has its "Copy Response" button and its text stopped changing. A notice that never gets
-    // that button is taken once unchanged for 30 s, unless it is a progress line ("Lining things up...").
+    // that button is taken once unchanged for 30 s, unless it is a progress line ("Lining things up...": 60 s).
     const timeout = this.o.replyTimeoutSec ?? 240;
     const deadline = Date.now() + timeout * 1000;
     let last = "", stable = 0, seen: { text: string; done: boolean } | null = null, notice = "";
@@ -282,9 +387,13 @@ export class CopilotWeb {
       seen = { text, done: r.done };
       stable = text && text === last ? stable + 1 : 0;
       last = text;
-      const progress = /(\.\.\.|…)\s*$/.test(text);
+      // the progress-line rule only while the button is missing: a finished reply may well end in "..."
+      const progress = !r.done && /(\.\.\.|…)\s*$/.test(text);
       if (progress && stable < 85) continue;
-      if ((r.done && stable >= 1) || stable >= 43) return { ok: true, text, chatId: await this.chatIdNow(p, chatsBefore) };
+      if ((r.done && stable >= 1) || stable >= 43) {
+        const via = r.done ? "button" : progress ? "progress60" : "stable30";
+        return { ok: true, text, chatId: await this.chatIdNow(p, chatsBefore), via };
+      }
     }
     throw new Error(`no reply from Copilot within ${timeout} s (${await this.whatWasThere(p, seen, notice)})`);
   }
@@ -304,14 +413,17 @@ export class CopilotWeb {
   // the open chat's id: from the address, or (a new chat gets its address and sidebar entry a moment after the
   // reply) the sidebar link that wasn't there before the message
   private async chatIdNow(p: Page, before: Set<string>): Promise<string | undefined> {
+    let fromUrl: string | undefined;
     for (let i = 0; i < 16; i++) {
-      const fromUrl = p.url().match(/conversation\/([0-9a-f-]{36})/i)?.[1];
-      if (fromUrl) return fromUrl;
+      // the address can still name the chat that was open before New chat was pressed: only an id that was not in the
+      // sidebar before the message is the new chat's
+      fromUrl = p.url().match(/conversation\/([0-9a-f-]{36})/i)?.[1];
+      if (fromUrl && !before.has(fromUrl)) return fromUrl;
       const added = (await this.chats(p)).find((c) => !before.has(c.id));
       if (added) return added.id;
       await p.waitForTimeout(500);
     }
-    return undefined;
+    return fromUrl;
   }
 
   // a code block shown as a rendered preview (Markdown, HTML) has a "Code" toggle: press it to see the raw text
@@ -334,10 +446,12 @@ export class CopilotWeb {
     const last = msgs.at(-1);
     return [
       `page: ${p.url().split("?")[0]} ("${await p.title().catch(() => "")}")${SIGN_IN.test(hostOf(p.url())) ? "  <== a SIGN-IN page" : ""}; Edge ${edge}`,
-      `chat box: ${(await p.locator(EDITOR).count().catch(() => 0)) ? "there" : "NOT there"}; sidebar chats: ${chats.length}; New chat link: ${(await p.getByRole("link", { name: "New chat", exact: true }).count().catch(() => 0)) ? "there" : "NOT there"}`,
+      `chat box: ${(await p.locator(EDITOR).count().catch(() => 0)) ? "there" : "NOT there"}; sidebar chats: ${chats.length}; New chat link: ${(await p.locator(SEL.newChat.join(", ")).count().catch(() => 0)) ? "there" : "NOT there"}`,
       `open chat: ${msgs.length} messages in the page` + (last ? `; the last is from ${last.role} (#${last.pos || "?"}, ${last.text.length} characters)` +
         (last.role === "copilot" ? (last.done ? ", with its Copy Response button" : ", WITHOUT a Copy Response button") : "") : ""),
       `Copilot notices: ${(await this.notice(p)) || "(none)"}`,
+      `pop-ups over the page: ${(await p.locator("[role=dialog],[role=alertdialog]").allInnerTexts().catch(() => [] as string[])).map((t) => `"${t.replace(/\s+/g, " ").trim().slice(0, 60)}"`).join(", ") || "(none)"}`,
+      `Send button: ${(await p.locator(SEL.send.join(", ")).count().catch(() => 0)) ? ((await p.locator(SEL.send.join(", ")).first().isEnabled().catch(() => false)) ? "there, enabled" : "there, disabled (normal while the box is empty)") : "NOT there"}; sign-in token refusals in the last minute: ${this.authFails.filter((t) => t > Date.now() - 60_000).length}${this.authBroken() ? "  <== the session is dead: sign in again" : ""}`,
     ];
   }
 
@@ -391,14 +505,18 @@ export class CopilotWeb {
   async remove(id: string, dryRun = false): Promise<Result> {
     if (!GUID.test(id)) throw new Error(`not a chat id: ${id}`);
     const p = await this.ready();
+    await this.sidebarSettled(p); // right after a delete the sidebar is reloading and its buttons do nothing
     const link = p.locator(`a[id="${id}"]`).first();
     if (!(await link.count())) return { ok: true, gone: true };
-    // the chat's "More" button (next to its link in the sidebar, marked with the chat's id); then More > Delete >
-    // "Delete chat?" > Delete
-    const more = p.locator(`[data-chat-history-more-button-conversation-id="${id}"]`).first();
+    // the chat's "More" button (next to its link in the sidebar, marked with the chat's id; drawn when the row is
+    // hovered); then More > Delete > "Delete chat?" > Delete
+    if (this.authBroken()) await this.reauth(p); // with a dead session a delete only looks done and comes back
+    const more = p.locator(SEL.more(id).join(", ")).first();
     let dialog = null;
     for (let attempt = 1; attempt <= 3 && !dialog; attempt++) {
+      if (attempt > 1) { await this.dismissPopups(p); await this.sidebarSettled(p); }
       if (!(await more.count())) throw new Error(`no More button next to chat ${id}`);
+      await link.hover({ timeout: 2000 }).catch(() => {});
       await press(more);
       const item = p.getByRole("menuitem", { name: "Delete" }).first();
       if (!(await item.waitFor({ timeout: 3000 }).then(() => true, () => false))) { await p.keyboard.press("Escape"); continue; }
@@ -406,7 +524,11 @@ export class CopilotWeb {
       const d = p.locator("[role=dialog],[role=alertdialog]").filter({ hasText: /Delete chat/i }).first(); // a Fluent alert dialog
       if (await d.waitFor({ timeout: 4000 }).then(() => true, () => false)) dialog = d;
     }
-    if (!dialog) throw new Error("the chat menu has no Delete item, or its confirmation did not open");
+    if (!dialog) {
+      const popups = await p.locator("[role=dialog],[role=alertdialog]").allInnerTexts().catch(() => [] as string[]);
+      const over = popups.map((t) => t.replace(/\s+/g, " ").trim().slice(0, 50)).filter(Boolean);
+      throw new Error(`the chat menu has no Delete item, or its confirmation did not open${over.length ? ` (a pop-up is over the page: "${over.join('" / "')}")` : ""}`);
+    }
     if (dryRun) {
       await press(dialog.getByRole("button", { name: "Cancel" }));
       return { ok: true, dryRun: true };

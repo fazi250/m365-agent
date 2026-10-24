@@ -11,3 +11,4 @@ __pycache__/
 diag.txt
 diag.png
 diag/
+tests/.tmp/

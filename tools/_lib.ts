@@ -2,6 +2,7 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 export type ToolContext = {
   workspace: string; // the agent's own folder: relative paths resolve here; default cwd for commands
@@ -13,6 +14,8 @@ export type ToolContext = {
   browserChannel: string; // "chrome" or "msedge"
   // call before changing or creating a file: the server keeps its original so the page can offer Keep / Undo
   trackWrite: (fullPath: string) => void;
+  // after a write: the syntax check's error line for that file (null = it passed), shown in the Files changed list
+  noteCheck: (fullPath: string, error: string | null) => void;
 };
 
 export type Tool = {
@@ -34,8 +37,60 @@ export type Tool = {
   runsCode?: boolean;
   // an argument that may come from the fenced code block after the JSON call instead of inside it
   blockArg?: string;
+  // the result is a program's output: the server tidies it (colour codes, repeated lines) before Copilot sees it
+  processOutput?: boolean;
+  // the tool creates or changes files: after it ran, the page's Files changed list (Keep / Undo) is refreshed
+  changesFiles?: boolean;
+  // the tool only reads (list_dir, read_file, search_files): a task made of such steps needs no verify round
+  readOnly?: boolean;
+  // runs BEFORE the approval card: a string is the result (the call is refused with that text, nothing runs and the
+  // user is not asked); null lets it go on. For a check that needs no approval, like a script's syntax.
+  precheck?: (args: Record<string, any>, ctx: ToolContext) => Promise<string | null>;
   run: (args: Record<string, any>, ctx: ToolContext) => Promise<string>;
 };
+
+// folders a repo listing or search leaves out: dependencies, build output, caches, and dot-folders other than a few
+const SKIP_DIRS = new Set(["node_modules", "venv", "__pycache__", "dist", "build", "test-results", "playwright-report", "backups", "coverage", "out", "target"]);
+const KEEP_DOT = new Set([".github", ".vscode", ".husky"]); // other dot-folders (.git, .venv, profiles, caches) are skipped
+export const isSkippedDir = (name: string) => SKIP_DIRS.has(name) || (name.startsWith(".") && !KEEP_DOT.has(name));
+
+// a glob ("**/*.ts", "src/**/*.{py,md}", "a?.txt") as a case-insensitive RegExp over a forward-slash relative path
+export function globToRegExp(glob: string): RegExp {
+  return new RegExp(`^${globSource(glob)}$`, "i");
+}
+function globSource(glob: string): string {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*" && glob[i + 1] === "*") {
+      if (glob[i + 2] === "/") { re += "(?:.*/)?"; i += 2; } else { re += ".*"; i += 1; }
+    } else if (c === "*") re += "[^/]*";
+    else if (c === "?") re += "[^/]";
+    else if (c === "{") { const j = glob.indexOf("}", i); if (j > i) { re += `(?:${glob.slice(i + 1, j).split(",").map(globSource).join("|")})`; i = j; } else re += "\\{"; } // {a*,b?} keeps its wildcards
+    else re += c.replace(/[.+^$()|[\]\\]/g, "\\$&");
+  }
+  return re;
+}
+
+// Sign-ins and prompts wait for someone to type or confirm, and the agent's hidden shells have no one at the
+// keyboard: the step would hang until its timeout. Signing in is the user's own step anyway, so these are not run.
+export const SIGN_IN = new RegExp(
+  "\\b(gh\\s+auth\\s+(login|refresh)|(npm|pnpm|yarn)\\s+(login|adduser)|az\\s+login|docker\\s+login|postman\\s+login|" +
+  "firebase\\s+login|vercel\\s+login|netlify\\s+login|heroku\\s+login|wrangler\\s+login|gcloud\\s+auth\\s+(application-default\\s+)?login|" +
+  "aws\\s+(configure|sso\\s+login)|Connect-(AzAccount|MgGraph|ExchangeOnline|MicrosoftTeams|PnPOnline)|Get-Credential|Read-Host)\\b",
+  "i",
+);
+
+// Programs installed while the server runs (install_package with winget) change the PATH in the registry only; read
+// it again before each command so they can be used right away.
+export const FRESH_PATH =
+  "$env:Path = $env:Path + ';' + [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User'); ";
+
+// The start of every PowerShell the agent runs: UTF-8 in and out (so "héllo ✓" survives), no progress bars in the
+// captured output, the fresh PATH.
+export const PS_PRELUDE =
+  "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Text.UTF8Encoding]::new($false); $ProgressPreference = 'SilentlyContinue'; " +
+  FRESH_PATH;
 
 // Programs started by runProcess that are still running, so Stop in the page can end them.
 const running = new Set<ChildProcess>();
@@ -55,27 +110,44 @@ export function stopProcesses(): number {
   return running.size;
 }
 
-// Runs a program with an argument list (no shell in between) and returns stdout + stderr.
+// Runs a program with an argument list (no shell in between) and returns stdout + stderr (decoded as UTF-8).
+// trailer: true ends the output with exactly one line saying how it ended and how long it took:
+//   [exit 0, 2.3 s] · [exit code 1, 14.2 s] · [killed: timeout after 600 s] · [stopped by the user after 4.0 s]
+// (without it: "[exit code N]" only when non-zero, as the tools that parse their program's output expect)
 export function runProcess(
   cmd: string,
   args: string[],
-  opts: { cwd: string; timeoutMs?: number; input?: string; env?: NodeJS.ProcessEnv },
+  opts: { cwd: string; timeoutMs?: number; input?: string; env?: NodeJS.ProcessEnv; trailer?: boolean },
 ): Promise<string> {
   return new Promise((resolve) => {
+    const started = Date.now();
+    const timeoutMs = opts.timeoutMs ?? 120_000;
+    if (!existsSync(opts.cwd)) { // spawn would blame the program ("not found: powershell") for a missing folder
+      return resolve(`error: the folder ${opts.cwd} does not exist${opts.trailer ? "\n[exit code 1, 0.0 s]" : "\n[exit code 1]"}`);
+    }
     const p = spawn(cmd, args, { cwd: opts.cwd, windowsHide: true, env: opts.env });
     running.add(p);
-    let out = "";
-    const t = setTimeout(() => { killTree(p); out += "\n[killed: timeout]"; }, opts.timeoutMs ?? 120_000);
-    p.stdout.on("data", (d) => (out += d));
-    p.stderr.on("data", (d) => (out += d));
+    const out = new StringDecoder("utf8"), err = new StringDecoder("utf8");
+    let text = "", timedOut = false;
+    const t = setTimeout(() => { timedOut = true; killTree(p); if (!opts.trailer) text += "\n[killed: timeout]"; }, timeoutMs);
+    p.stdout.on("data", (d) => (text += out.write(d)));
+    p.stderr.on("data", (d) => (text += err.write(d)));
     p.on("error", (e: NodeJS.ErrnoException) => {
-      out += e.code === "ENOENT" ? `\n[not found: ${cmd}]` : `\n[error: ${e.message}]`;
+      text += e.code === "ENOENT" ? `\n[not found: ${cmd}]` : `\n[error: ${e.message}]`;
     });
     p.on("close", (code) => {
       clearTimeout(t);
       running.delete(p);
-      if (stopped.has(p)) out += "\n[stopped by the user]";
-      resolve(`${out.trim()}${code ? `\n[exit code ${code}]` : ""}` || "(no output)");
+      text += out.end() + err.end();
+      if (opts.trailer) {
+        const secs = ((Date.now() - started) / 1000).toFixed(1);
+        const end = stopped.has(p) ? `[stopped by the user after ${secs} s]`
+          : timedOut ? `[killed: timeout after ${Math.round(timeoutMs / 1000)} s]`
+          : code ? `[exit code ${code}, ${secs} s]` : `[exit 0, ${secs} s]`;
+        return resolve(`${text.trim() || "(no output)"}\n${end}`);
+      }
+      if (stopped.has(p)) text += "\n[stopped by the user]";
+      resolve(`${text.trim()}${code ? `\n[exit code ${code}]` : ""}` || "(no output)");
     });
     p.stdin.end(opts.input ?? "", "utf8");
   });
@@ -99,9 +171,16 @@ function currentWindowsPath(): string {
 
 // The environment for commands the agent runs: what install_package installed comes first on the PATH (npm commands
 // in the workspace, the venv's scripts), and programs installed since the server started are found too. Windows keeps
-// the variable as "Path"; replace it under its own name.
-export function commandEnv(ctx: ToolContext): NodeJS.ProcessEnv {
-  const env = { ...process.env };
+// the variable as "Path"; replace it under its own name. Output is plain UTF-8 without colours, nothing prompts for
+// input. ci: true (test runners) makes them run once instead of in watch mode; never set it for builds (CRA turns
+// lint warnings into errors under CI).
+export function commandEnv(ctx: ToolContext, o: { ci?: boolean } = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8", PYTHONUNBUFFERED: "1",
+    NO_COLOR: "1", FORCE_COLOR: "0", TERM: "dumb", GIT_TERMINAL_PROMPT: "0", npm_config_color: "false",
+  };
+  if (o.ci) env.CI = "true";
   const key = Object.keys(env).find((k) => k.toLowerCase() === "path") ?? "Path";
   const extra = [path.join(ctx.workspace, "node_modules", ".bin"), path.dirname(ctx.python)];
   env[key] = [...extra, env[key] ?? "", currentWindowsPath()].filter(Boolean).join(path.delimiter);

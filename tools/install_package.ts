@@ -28,6 +28,7 @@ const tidy = (out: string) =>
 
 const tool: Tool = {
   name: "install_package",
+  processOutput: true,
   description:
     "Install something a step needs, then use it. manager \"pip\" (default): Python packages into this framework's " +
     "venv for run_python (added to requirements.txt). manager \"npm\": Node packages and their commands (newman, " +

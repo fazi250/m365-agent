@@ -33,6 +33,7 @@ function argvOf(args: Record<string, any>): string[] {
 
 const tool: Tool = {
   name: "github",
+  processOutput: true,
   description:
     "Run the GitHub CLI (gh) to get references from any GitHub repo. Pass the gh arguments as a list. " +
     'Examples: ["repo","view","cli/cli"] · ["search","repos","playwright mcp","--limit","5"] · ' +

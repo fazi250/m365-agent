@@ -12,11 +12,14 @@
 // Run: node server.ts   (Node 23.6+ runs TypeScript directly)
 import http from "node:http";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stopProcesses, type Tool, type ToolContext } from "./tools/_lib.ts";
 import { CopilotWeb } from "./copilot-web.ts";
+import { MARK, agentPrompt, askUserResultMessage, checksMissFailures, compact, correctionMessage, cutResult, diffLines, factLines, parseCall, readOutput, resultMessage, statusOf, verifyPrompt, type Call, type Ledger, type LedgerRun } from "./agent-core.ts";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
@@ -26,6 +29,8 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const defaults = {
   port: 4317, workspace: "workspace", projects: [] as string[], readRoots: [] as string[], maxSteps: 40, maxResult: 8000,
   bridgeScript: "", browser: "msedge", pythonIndexUrl: "", copilotUrl: "https://m365.cloud.microsoft/chat",
+  replyTimeoutSec: 240, // how long to wait for one Copilot reply
+  logFile: "", // the trace (default agent.log next to server.ts; relative to the config file)
 };
 const configFile = process.env.M365_AGENT_CONFIG ? path.resolve(process.env.M365_AGENT_CONFIG) : path.join(ROOT, "config.json");
 const config = { ...defaults, ...(existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {}) };
@@ -64,9 +69,10 @@ const ctx: ToolContext = {
   pythonIndexUrl: String(config.pythonIndexUrl ?? ""),
   browserChannel: config.browser,
   trackWrite: (full) => trackWrite(full),
+  noteCheck: (full, error) => noteCheck(full, error),
 };
 const FAKE_BRIDGE = config.bridgeScript ? path.resolve(path.dirname(configFile), config.bridgeScript) : "";
-const copilot = new CopilotWeb({ root: ROOT, url: config.copilotUrl, channel: config.browser });
+const copilot = new CopilotWeb({ root: ROOT, url: config.copilotUrl, channel: config.browser, replyTimeoutSec: Number(config.replyTimeoutSec) || 240 });
 
 // ── tools: every tools/*.ts except _*.ts ──
 const tools = new Map<string, Tool>();
@@ -83,7 +89,7 @@ function approvalLabel(t: Tool): string {
 
 // ── agent.log: a trace of every task, Copilot command, tool call and error, to see afterwards what went wrong
 //    (npm run diag shows its end). Messages are cut to their start; file contents are not logged. ──
-const LOG_FILE = path.join(ROOT, "agent.log");
+const LOG_FILE = config.logFile ? path.resolve(path.dirname(configFile), config.logFile) : path.join(ROOT, "agent.log");
 function log(line: string) {
   try {
     if (existsSync(LOG_FILE) && statSync(LOG_FILE).size > 1_000_000) renameSync(LOG_FILE, LOG_FILE + ".old");
@@ -122,7 +128,7 @@ async function captureFailure(cmd: string, error: string) {
 // ── Copilot: one command at a time, since it is one page ──
 type Chat = { id: string; title: string };
 type Msg = { role: "user" | "copilot"; text: string };
-type BridgeResult = { ok: boolean; error?: string; text?: string; chatId?: string; chats?: Chat[]; messages?: Msg[]; closed?: boolean };
+type BridgeResult = { ok: boolean; error?: string; text?: string; chatId?: string; chats?: Chat[]; messages?: Msg[]; closed?: boolean; via?: string };
 type BridgeCmd = "list" | "read" | "open" | "ask" | "delete";
 type BridgeOpts = { input?: string; newChat?: boolean; id?: string; noLaunch?: boolean };
 
@@ -141,7 +147,10 @@ function bridge(cmd: BridgeCmd, opts: BridgeOpts = {}): Promise<BridgeResult> {
     } catch (e) {
       r = { ok: false, error: (e instanceof Error ? e.message : String(e)).split("\n")[0] };
     }
-    log(`copilot ${cmd}${opts.id ? ` ${opts.id}` : ""}${opts.newChat ? " -New" : ""} ${Date.now() - started}ms -> ${r.ok ? "ok" : `ERROR ${r.error}`}`);
+    // for ask: how the reply was taken as finished (via button = its Copy Response button; stable30 / progress60 = its
+    // text just stopped changing) and its length, to tell slow replies from slow detection
+    const how = cmd === "ask" && r.ok ? ` via ${r.via ?? "-"}, ${(r.text ?? "").length} chars` : "";
+    log(`copilot ${cmd}${opts.id ? ` ${opts.id}` : ""}${opts.newChat ? " -New" : ""} ${Date.now() - started}ms -> ${r.ok ? `ok${how}` : `ERROR ${r.error}`}`);
     if (!r.ok && !FAKE_BRIDGE) await captureFailure(cmd, String(r.error));
     return r;
   };
@@ -150,14 +159,16 @@ function bridge(cmd: BridgeCmd, opts: BridgeOpts = {}): Promise<BridgeResult> {
   return p;
 }
 
-// the fake Copilot for tests (config bridgeScript): one PowerShell call per command, the message on stdin
+// the fake Copilot for tests (config bridgeScript): one call per command (a PowerShell script, or a Node .mjs
+// script like tests/fake-bridge.mjs), the message on stdin, one JSON line back
 function fakeBridge(cmd: BridgeCmd, opts: BridgeOpts): Promise<BridgeResult> {
   return new Promise((resolve) => {
-    const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", FAKE_BRIDGE, cmd];
+    const node = FAKE_BRIDGE.endsWith(".mjs");
+    const args = node ? [FAKE_BRIDGE, cmd] : ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", FAKE_BRIDGE, cmd];
     if (opts.newChat) args.push("-New");
     if (opts.id) args.push("-Id", opts.id);
     if (opts.noLaunch) args.push("-NoLaunch");
-    const ps = spawn("powershell", args, { windowsHide: true });
+    const ps = spawn(node ? process.execPath : "powershell", args, { windowsHide: true });
     let out = "";
     ps.stdout.on("data", (d) => (out += d));
     ps.stderr.on("data", (d) => (out += d));
@@ -181,6 +192,7 @@ async function askCopilot(input: string, newChat: boolean): Promise<BridgeResult
 let chats: Chat[] = [];
 let currentChat: string | null = null; // the chat open in Copilot, as far as this server knows
 let busy = false;
+let taskSeq = 0; // one per message sent in agent mode
 
 // background: the timer's sync. It never opens the Copilot window: if you closed it, it stays closed until you send
 // a message, open a chat or press Sync.
@@ -192,107 +204,21 @@ async function refreshChats(background = false): Promise<void> {
   emit({ type: "chats", chats });
 }
 
-// ── tool calls ──
-type Call = { tool: string; args: Record<string, any>; why?: string };
-const MARK = "[local-agent]"; // starts every message this app sends in agent mode, so the page can render old ones
-let lastParseError = "";
+// ── tool calls: the prompt, the parser and the messages back to Copilot live in agent-core.ts (shared with tests and
+//    the page). ──
+const blockArgOf = (name: string) => tools.get(name)?.blockArg;
 
-// Copilot writes Windows paths with single backslashes ("C:\devl"), which is invalid JSON; double the stray ones.
-function parseLenient(s: string): any {
-  try {
-    return JSON.parse(s);
-  } catch (e) {
-    try {
-      // take each escape as a unit so an already valid "\\" pair is left alone
-      return JSON.parse(s.replace(/\\(["\\/bfnrtu]?)/g, (m, c) => (c ? m : "\\\\")));
-    } catch {
-      lastParseError = e instanceof Error ? e.message : String(e);
-      return null;
-    }
-  }
-}
-
-// first balanced {...} in the text (honouring strings) that parses as a tool call
-function findCall(text: string): Call | null {
-  const start = text.indexOf("{");
-  if (start < 0) return null;
-  let depth = 0, inStr = false, esc = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === "\\") esc = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') inStr = true;
-    else if (ch === "{") depth++;
-    else if (ch === "}" && --depth === 0) {
-      const obj = parseLenient(text.slice(start, i + 1));
-      if (obj && typeof obj.tool === "string") return { tool: obj.tool, args: obj.args ?? {}, why: obj.why };
-      if (obj) lastParseError = 'missing "tool"';
-      return null;
-    }
-  }
-  return null;
-}
-
-// A reply is a JSON tool call, optionally followed by a fenced code block that carries a file or a script (so code
-// never has to be escaped inside JSON). The call is looked for outside the code blocks first, then inside them (some
-// replies fence the JSON itself); a tool's blockArg (write_file: content, run_python: code) is taken from the block.
-function parseCall(reply: string): Call | null {
-  lastParseError = "no JSON object found";
-  const blocks: string[] = [];
-  // a block ends at a fence of the same kind and length (``` / ```` / ~~~), so a README holding ``` samples stays whole
-  const outside = reply.replace(/^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)\n?^\1[ \t]*$/gm, (_m, _f, code) => { blocks.push(code); return "\n"; });
-  let call = findCall(outside), used = -1;
-  for (let i = 0; !call && i < blocks.length; i++) if ((call = findCall(blocks[i]))) used = i;
-  if (!call) return null;
-  const arg = tools.get(call.tool)?.blockArg;
-  if (arg && call.args[arg] == null) {
-    const block = blocks.find((_b, i) => i !== used);
-    if (block != null) call.args[arg] = block;
-  }
-  return call;
-}
-
-// The task goes first so Copilot titles the chat after it; the page splits stored messages at "\n\n[local-agent] ".
-function agentPrompt(selected: Tool[], task: string): string {
-  const list = selected.map((t) => `- ${t.name}: ${t.description}\n  args example: ${t.args}`).join("\n");
-  return `${task}
-
-${MARK} You are the agent for the message above, working on my Windows PC through the tools below. If it is a question or chat that needs no tool (explain, compare, advise), just answer it in plain text. If it asks you to do something, do it with the tools: each turn I run ONE tool for you and paste its result back.
-For a tool step, reply with ONLY one JSON object and no other text:
-{"tool": "<name>", "args": {...}, "why": "<short reason>"}
-
-Tools:
-${list}
-- ask_user: stop and ask me something, then wait: my answer comes back as the RESULT. Use it whenever you need me: a sign-in or login page, a code or captcha, a choice between options, details you don't have, or a step only I can do.
-  args example: {"question": "Postman shows its sign-in page in the Edge window. Please sign in there, then press Continue."}
-- done: finish and give me the answer, with what you checked.
-  args example: {"answer": "<final answer>", "checks": ["Option1 is checked: the click RESULT says checked", "report.docx has 4 steps and 4 images: read_file shows them"]}
-
-Rules:
-- One tool per reply; wait for the RESULT before the next step; use done when the task is finished or cannot be done.
-- Do as much as you can yourself, so I have as little to do as possible. If no tool does a step directly, write a PowerShell command (shell) or a Python script (run_python) that does it, and install what it needs (install_package): I approve each one, so you have my permission to propose them. Examples: bring a window to the front or resize it, copy or rename files, call an API, convert a file, check a port.
-- ask_user only for what really needs me: signing in, passwords and codes, a decision between options, details you don't have. Never ask me to do something a tool or a command can do (bring the browser to the front, take a snap, open a page again, find a file). When a step needs me, ask, wait for my answer and go on from there; never skip it, and never switch to another app, site or way of doing it without asking me.
-- Check every step like a careful engineer: read each RESULT and make sure the step did what you wanted (the right page opened, not a sign-in or error page; the box is now checked; the file was written; the response is the expected one). If it didn't, fix it, try another way or ask me; don't build on a step that failed.
-- Before done, verify the whole task: go through every part of my request and check it against the RESULTs, and check with a tool what you haven't seen yet (browser read or elements, screen read, list_dir, read_file of the files you made: it reads .docx, .pptx and .xlsx too). In done, checks has one line per part of my request: how you know it is done, or that it is not done and why.
-- Be honest. Say only what the tool RESULTs show: never write (in done, a report, a caption) that something was typed, clicked, highlighted, sent or verified unless a RESULT shows it. When a step could not be done or a tool cannot do it, say so plainly instead of describing it as done.
-- Do not use your own code execution, file creation or web browsing: they don't reach my PC. Use the tools.
-- Files you make for me (reports, decks, screenshots, notes) go in the workspace folder ${workspace.replace(/\\/g, "/")}: give paths relative to it (report.docx, screenshots/step-01.png).
-${projects.length ? `- Code repos live in ${projects.map((p) => p.replace(/\\/g, "/")).join(", ")}: create a new repo as a folder there (e.g. ${projects[0].replace(/\\/g, "/")}/my-repo) and change existing repos there, using absolute paths.\n` : ""}- You may read and write files anywhere on my PC with absolute paths; outside my trusted folders I approve each one, so only touch what the task needs.
-- To create or change a file, write the WHOLE file with write_file (never a fragment). Before changing an existing file, read it fully with read_file. To understand a repo, start with list_dir recursive.
-- If a package or command-line tool is missing (a Python or npm package, a Windows program), install it with install_package, then use it.
-- Manual testing with evidence, like a tester documenting by hand, one step at a time, with a full-screen snap (window in front, taskbar included) right after each step that red-boxes exactly what the step changed or shows (the checkbox, request name, URL, method, payload lines, status code). In a web page (Postman Web too): do the step with the browser tool and use evidence: true (or browser screenshot with target / highlight). In a desktop app, which no tool can click or type in: put what I have to paste on the clipboard (screen clipboard: a payload, or a cURL for Postman's URL box), give me the hand step in the ask of a screen snap with highlight. Use browser read or screen read to check what is shown. Then make_docx: per step a heading, what was done and by whom, the snap, and a caption naming what the red box marks (only boxes the RESULT reported).
-- Write Windows paths with forward slashes (C:/devl/x) so the JSON stays valid.
-- write_file and run_python: do NOT put the file or the code inside the JSON. Reply with the JSON line, then the complete file or code in ONE fenced code block right after it, for example:
-{"tool": "write_file", "args": {"path": "C:/devl/my-repo/package.json"}, "why": "project manifest"}
-\`\`\`json
-{ "name": "my-repo" }
-\`\`\`
-  Label the block \`\`\`text (or the code's language), never \`\`\`markdown or \`\`\`html: those show a preview and I lose the raw file.
-  If the file itself contains \`\`\` lines (a README with code samples), fence it with ~~~~text instead.`;
+// The full output of the last 20 tool runs (numbered, up to 2 MB each): a long RESULT goes to Copilot cut in the
+// middle, and read_output gives it the rest on request, in the same chat only (what one chat was allowed to read
+// stays there). Not kept across a server restart.
+type Run = { n: number; tool: string; text: string; step: number; at: string; chat: string };
+const runs = new Map<number, Run>();
+let runSeq = 0;
+function keepRun(tool: string, text: string, step: number, chat: string): Run {
+  const run = { n: ++runSeq, tool, text: text.slice(0, 2_000_000), step, at: new Date().toISOString(), chat };
+  runs.set(run.n, run);
+  while (runs.size > 20) runs.delete(runs.keys().next().value!);
+  return run;
 }
 
 // ── approvals: Allow once / Allow for this task / Always allow / Deny ──
@@ -317,15 +243,13 @@ function askUser(question: string): Promise<string | null> {
   return new Promise((resolve) => questions.set(id, resolve));
 }
 
-// Copilot's first "done" in a task that used tools gets this once: check every part of the request before finishing.
-const VERIFY = `${MARK} Before you finish, verify the task like a careful engineer. Go through every part of my request (at the top of this chat) one by one and find the RESULT that shows it is done. Whatever no RESULT shows yet, check it now with a tool (browser read or elements, screen read, list_dir, read_file of the files you made). If something is missing or wrong, do or fix it now, or use ask_user if you need me. Then send done again with "checks": one line per part of my request saying how you know it is done, or that it is not done and why.`;
-
 function ruleOf(t: Tool, args: Record<string, any>): { key: string; label: string } {
   try { if (t.alwaysRule) return t.alwaysRule(args, ctx); } catch { /* fall back to the exact args */ }
   return { key: JSON.stringify(args), label: `this exact ${t.name} call` };
 }
 
 async function approve(t: Tool, c: Call): Promise<boolean> {
+  if (stopRequested) return false; // Stop was pressed while Copilot was answering: nothing more runs
   let ask = true;
   try { ask = t.needsApproval(c.args, ctx); } catch { /* malformed args: ask */ }
   if (!ask) return true;
@@ -360,7 +284,8 @@ async function approve(t: Tool, c: Call): Promise<boolean> {
 // ── Keep / Undo: files the agent changed, until you keep or undo them ──
 // The first time the agent writes a file, its original (or "didn't exist") is saved in workspace/.changes, so Undo
 // can put it back however many times the agent rewrote it. Keep forgets the original. Survives a server restart.
-type Change = { path: string; original: string | null; at: string }; // original: base64 of the old bytes, null = new file
+// original: base64 of the old bytes, null = new file; check: the syntax check's error line after the last write
+type Change = { path: string; original: string | null; at: string; check?: string | null };
 const CHANGES_FILE = path.join(workspace, ".changes", "index.json");
 let changes: Change[] = existsSync(CHANGES_FILE) ? JSON.parse(readFileSync(CHANGES_FILE, "utf8")) : [];
 const saveChanges = () => {
@@ -374,29 +299,68 @@ function trackWrite(full: string) {
   changes.push({ path: full, original: existsSync(full) ? readFileSync(full).toString("base64") : null, at: new Date().toISOString() });
   saveChanges();
 }
+let lastWritten = ""; // the file the last write_file / edit_file touched (for the project-checks hint)
+function noteCheck(full: string, error: string | null) {
+  lastWritten = full;
+  const c = changes.find((x) => samePath(x.path, full));
+  if (!c) return;
+  c.check = error;
+  saveChanges();
+}
+
+// ── the task ledger (agent-core Ledger): files written, commands run with their last status, declined steps ──
+type Book = { writes: Map<string, { path: string; tool: string; step: number }>; runs: Map<string, LedgerRun>; declined: string[]; asked: number; mutatingRuns: number; verifyAsked: boolean };
+const newBook = (): Book => ({ writes: new Map(), runs: new Map(), declined: [], asked: 0, mutatingRuns: 0, verifyAsked: false });
+// what a call was, in a few words, for the ledger and the Facts
+function summarize(tool: string, args: Record<string, any>): string {
+  if (tool === "shell") return args.script ? `script ${args.name ?? ""} (${createHash("sha256").update(String(args.script)).digest("hex").slice(0, 8)})`.replace("  ", " ") : `${args.command ?? ""}${args.cwd ? ` (in ${args.cwd})` : ""}`;
+  if (tool === "run_python") return `${args.module ? `python -m ${args.module}` : String(args.path ?? `scripts/${args.name ?? "script"}.py`)}${Array.isArray(args.argv) && args.argv.length ? ` ${args.argv.join(" ")}` : ""}${args.cwd ? ` (in ${args.cwd})` : ""}`;
+  if (tool === "github") return `gh ${Array.isArray(args.args) ? args.args.join(" ") : ""}`;
+  if (tool === "install_package") return `${args.manager ?? "pip"} ${[].concat(args.packages ?? args.package ?? []).join(" ")}`;
+  if (tool === "browser") return `${args.action ?? ""} ${args.url ?? args.target ?? ""}`.trim();
+  if (tool === "screen") return `${args.action ?? ""} ${args.app ?? args.window ?? ""}`.trim();
+  return JSON.stringify(args).slice(0, 80);
+}
+// the ledger with what the disk says now about the files Copilot wrote
+function ledgerOf(b: Book): Ledger {
+  return {
+    writes: [...b.writes.values()].map((w) => {
+      const exists = existsSync(w.path);
+      const lines = exists ? readText(w.path).split(/\r?\n/).filter((_l, i, a) => i < a.length - 1 || _l !== "").length : 0;
+      return { ...w, exists, lines, check: changes.find((c) => samePath(c.path, w.path))?.check ?? null };
+    }),
+    runs: [...b.runs.values()], declined: b.declined, asked: b.asked, mutatingRuns: b.mutatingRuns, verifyAsked: b.verifyAsked,
+  };
+}
+
+// Once per repo folder per task: the checks a repo defines (npm scripts, pytest), so Copilot runs them when the
+// change is complete.
+const hinted = new Set<string>();
+function projectChecksHint(full: string): string {
+  if (full.toLowerCase().startsWith(workspace.toLowerCase() + path.sep)) return ""; // the agent's own files, not a repo
+  const root = projects.find((p) => full.toLowerCase().startsWith(p.toLowerCase() + path.sep));
+  if (!root) return "";
+  for (let dir = path.dirname(full); dir.length >= root.length; dir = path.dirname(dir)) {
+    const checks: string[] = [];
+    const pkg = path.join(dir, "package.json");
+    if (existsSync(pkg)) {
+      try {
+        const scripts = JSON.parse(readFileSync(pkg, "utf8")).scripts ?? {};
+        for (const s of ["lint", "typecheck", "build", "test"]) if (scripts[s]) checks.push(s === "test" ? "npm test" : `npm run ${s}`);
+      } catch { /* not a readable package.json */ }
+    }
+    if (existsSync(path.join(dir, "pytest.ini")) || (existsSync(path.join(dir, "pyproject.toml")) && /\[tool\.pytest/.test(readText(path.join(dir, "pyproject.toml"))))) checks.push("python -m pytest");
+    if (checks.length) {
+      if (hinted.has(dir.toLowerCase())) return "";
+      hinted.add(dir.toLowerCase());
+      return `project checks: ${checks.join(", ")} (in ${dir.replace(/\\/g, "/")}): run them with shell when the change is complete`;
+    }
+    if (dir === root || path.dirname(dir) === dir) break;
+  }
+  return "";
+}
 
 const readText = (p: string) => (existsSync(p) ? readFileSync(p, "utf8") : "");
-
-// Line diff (longest common subsequence); big files fall back to "all removed, all added".
-type DiffLine = { t: " " | "+" | "-"; s: string };
-function diffLines(before: string, after: string): DiffLine[] {
-  const a = before === "" ? [] : before.split(/\r?\n/), b = after === "" ? [] : after.split(/\r?\n/);
-  if (a.length * b.length > 4_000_000) return [...a.map((s) => ({ t: "-" as const, s })), ...b.map((s) => ({ t: "+" as const, s }))];
-  const w = b.length + 1, lcs = new Uint32Array((a.length + 1) * w);
-  for (let i = a.length - 1; i >= 0; i--)
-    for (let j = b.length - 1; j >= 0; j--)
-      lcs[i * w + j] = a[i] === b[j] ? lcs[(i + 1) * w + j + 1] + 1 : Math.max(lcs[(i + 1) * w + j], lcs[i * w + j + 1]);
-  const out: DiffLine[] = [];
-  let i = 0, j = 0;
-  while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) { out.push({ t: " ", s: a[i] }); i++; j++; }
-    else if (lcs[(i + 1) * w + j] >= lcs[i * w + j + 1]) out.push({ t: "-", s: a[i++] });
-    else out.push({ t: "+", s: b[j++] });
-  }
-  while (i < a.length) out.push({ t: "-", s: a[i++] });
-  while (j < b.length) out.push({ t: "+", s: b[j++] });
-  return out;
-}
 
 function changeSummary() {
   return changes.map((c) => {
@@ -404,7 +368,7 @@ function changeSummary() {
     const d = diffLines(before, readText(c.path));
     return {
       path: c.path, kind: c.original == null ? "new" : existsSync(c.path) ? "modified" : "deleted",
-      added: d.filter((l) => l.t === "+").length, removed: d.filter((l) => l.t === "-").length,
+      added: d.filter((l) => l.t === "+").length, removed: d.filter((l) => l.t === "-").length, check: c.check ?? null,
     };
   });
 }
@@ -421,6 +385,8 @@ async function send(chatId: string | null, message: string, toolNames: string[])
   busy = true;
   stopRequested = false;
   taskGrants.clear(); // "Allow for this task" ends with the task
+  hinted.clear();
+  taskSeq++;
   emit({ type: "busy" });
   emit({ type: "user", text: message });
   log(`task: ${chatId ? `chat ${chatId}` : "new chat"}, tools: ${toolNames.join(",") || "none (chat mode)"}: "${short(message, 80)}"`);
@@ -448,68 +414,113 @@ async function send(chatId: string | null, message: string, toolNames: string[])
       emit({ type: "reply", text: r.text ?? "" });
       log(`task end: reply (${(r.text ?? "").length} characters)`);
     } else {
-      let out = agentPrompt(selected, message);
-      let badCalls = 0, toolRuns = 0, verifyAsked = false;
+      let out = agentPrompt(selected, message, { workspace, projects });
+      let badCalls = 0, toolRuns = 0;
+      const book = newBook();
+      const facts = () => factLines(ledgerOf(book));
+      const chatKey = () => chatId ?? startedId ?? `task-${taskSeq}`; // the chat the runs belong to (a new chat has its id after the first reply)
       for (let step = 1; step <= config.maxSteps && !stopRequested; step++) {
         emit({ type: "status", text: `step ${step}: waiting for Copilot…` });
         const r = await ask(out, newChat && step === 1);
-        if (!r.ok) return emit({ type: "error", text: String(r.error) });
+        if (stopRequested) break; // Stop was pressed while waiting: the reply is dropped
+        if (!r.ok) return emit({ type: "error", text: String(r.error), facts: toolRuns ? facts() : [] });
         const reply = r.text ?? "";
-        const call = parseCall(reply);
+        const { call, error: parseError } = parseCall(reply, blockArgOf);
         if (!call) {
-          // plain text is an answer (a question, an explanation, or Copilot's own wrap-up), like a chat reply;
           // a reply that tried to be a tool call but isn't valid JSON gets one more chance (twice at most)
-          if (!/"tool"\s*:/.test(reply) || ++badCalls > 2) { log(`task end: plain reply (${reply.length} characters)`); return emit({ type: "reply", text: reply }); }
-          log(`  not a valid tool call (${lastParseError}): "${short(reply, 160)}"`);
-          emit({ type: "status", text: `not a valid tool call (${lastParseError}); asking Copilot again` });
-          out = `${MARK} Your reply was not one valid JSON tool call (${lastParseError}). Reply with ONLY {"tool": ..., "args": {...}, "why": ...}. Write Windows paths with forward slashes.`;
-          continue;
+          if (/"tool"\s*:/.test(reply) && ++badCalls <= 2) {
+            log(`  not a valid tool call (${parseError}): "${short(reply, 160)}"`);
+            emit({ type: "status", text: `not a valid tool call (${parseError}); asking Copilot again` });
+            out = correctionMessage(parseError);
+            continue;
+          }
+          // plain text after tool runs: once, ask for a proper ending (done, ask_user or the next call), with the facts;
+          // otherwise plain text is an answer (a question, an explanation), like a chat reply
+          if (toolRuns && !book.verifyAsked) {
+            book.verifyAsked = true;
+            log(`  plain text after ${toolRuns} tool run(s): asking for done`);
+            emit({ type: "note", text: "Copilot answered in text instead of done: asking it to finish properly" });
+            out = verifyPrompt(ledgerOf(book), { nudge: true });
+            continue;
+          }
+          log(`task end: plain reply (${reply.length} characters)${toolRuns ? " without done" : ""}`);
+          if (toolRuns) emit({ type: "note", text: "Copilot stopped without done" });
+          return emit({ type: "reply", text: reply, facts: toolRuns ? facts() : [] });
         }
         badCalls = 0;
         if (call.tool === "done") {
-          if (toolRuns && !verifyAsked) { // like a careful engineer: check the whole task once before finishing
-            verifyAsked = true;
+          if (toolRuns && !book.verifyAsked && book.mutatingRuns) { // like a careful engineer: check the whole task once before finishing
+            book.verifyAsked = true;
             emit({ type: "note", text: "Copilot says it is done: asking it to verify every part of the task first" });
-            out = VERIFY;
+            out = verifyPrompt(ledgerOf(book));
             continue;
           }
           const checks = Array.isArray(call.args.checks) ? call.args.checks.map(String) : call.args.checks ? [String(call.args.checks)] : [];
-          log(`task end: done, ${checks.length} checks`);
-          return emit({ type: "done", text: String(call.args.answer ?? ""), checks });
+          const f = toolRuns ? facts() : [];
+          const warning = checksMissFailures(f, checks) ? "Copilot's checks do not mention these failures." : null;
+          log(`task end: done, ${checks.length} checks${toolRuns && !book.mutatingRuns ? " (read-only task: no verify round)" : ""}${warning ? "; checks miss the failures in the facts" : ""}`);
+          return emit({ type: "done", text: String(call.args.answer ?? ""), checks, facts: f, warning });
         }
         if (call.tool === "ask_user") {
+          if (stopRequested) break;
           emit({ type: "call", call });
           log(`  ask_user: "${short(call.args.question, 100)}"`);
           const answer = await askUser(String(call.args.question ?? call.args.text ?? "").trim() || "(Copilot asked without a question)");
           if (answer === null || stopRequested) break;
+          book.asked++;
           const result = answer.trim() ? `The user answered: ${answer.trim()}` : "The user pressed Continue: the step you asked for is done.";
           emit({ type: "result", tool: "ask_user", text: result });
-          out = `${MARK} RESULT of ask_user:\n${result}\n\nNext tool call (JSON only), or done; check first that what you asked for really happened.`;
+          out = askUserResultMessage(result);
+          continue;
+        }
+        if (call.tool === "read_output") { // more of an earlier run's output of THIS chat (no approval: it was already shown here)
+          emit({ type: "call", call });
+          const run = runs.get(Number(call.args.run));
+          const mine = [...runs.values()].filter((x) => x.chat === chatKey()).map((x) => x.n);
+          const result = run && run.chat === chatKey() ? readOutput(run, call.args, config.maxResult)
+            : `no run #${call.args.run ?? "?"} to read in this chat (its runs: ${mine.join(", ") || "none"}; runs of other chats or before a server restart are not kept)`;
+          log(`  read_output ${short(JSON.stringify(call.args), 120)} -> ${result.length} characters`);
+          emit({ type: "result", tool: "read_output", text: result });
+          out = resultMessage("read_output", result);
           continue;
         }
         const t = selected.find((x) => x.name === call.tool);
         emit({ type: "call", call });
-        let result: string;
+        let result: string, run: Run | null = null, refused: string | null = null;
+        try { refused = (await t?.precheck?.(call.args, ctx)) ?? null; } catch { /* a failing precheck never blocks the call */ }
         if (!t) {
-          result = `tool "${call.tool}" is not enabled in this chat; use one of: ${selected.map((x) => x.name).join(", ")}, ask_user, done`;
+          result = `tool "${call.tool}" is not enabled in this chat; use one of: ${selected.map((x) => x.name).join(", ")}, ask_user, read_output, done`;
+        } else if (refused) { // a script with a syntax error: refused before the approval card
+          result = refused;
+          log(`  tool ${call.tool} refused before approval: ${short(refused, 160)}`);
         } else if (await approve(t, call)) {
           emit({ type: "status", text: `step ${step}: running ${t.name}… (Stop ends it)` });
           toolRuns++;
           const t1 = Date.now();
+          lastWritten = "";
           try { result = await t.run(call.args, ctx); } catch (e) { result = `error: ${e instanceof Error ? e.message : e}`; }
-          const problem = /^(error|not run|not typed|no |unknown|could not|screen tool failed)/i.test(result) || /\[exit code \d+\]/.test(result);
-          log(`  tool ${call.tool} ${short(JSON.stringify(call.args), 160)} ${Date.now() - t1}ms -> ${problem ? `PROBLEM ${short(result, 240)}` : `ok (${result.length} characters)`}`);
-          if (call.tool === "write_file") emitChanges(); // the Keep / Undo list in the page
+          if (t.processOutput) result = compact(result, { repeats: true });
+          const { problem, exit } = statusOf(result, { data: !!t.readOnly });
+          if (t.changesFiles && lastWritten && !problem && !result.includes("SYNTAX ERROR")) { const hint = projectChecksHint(lastWritten); if (hint) result += `\n${hint}`; }
+          run = keepRun(call.tool, result, step, chatKey());
+          log(`  tool ${call.tool} ${short(JSON.stringify(call.args), 160)} ${Date.now() - t1}ms -> ${problem ? `PROBLEM ${short(result, 240)}` : `ok (${result.length} characters)`} [run #${run.n}]`);
+          // the ledger: files written, and every run by what it was (the last status of a repeated command wins)
+          if (t.changesFiles && lastWritten) book.writes.set(lastWritten.toLowerCase(), { path: lastWritten, tool: t.name, step });
+          else { const summary = summarize(t.name, call.args); book.runs.set(`${t.name}|${summary}`, { tool: t.name, summary, step, problem, exit }); }
+          if (!t.readOnly) book.mutatingRuns++;
+          if (t.changesFiles) emitChanges(); // the Keep / Undo list in the page
         } else {
           result = "The user declined to run this. Choose another way or use done.";
-          log(`  tool ${call.tool} declined by the user`);
+          if (!stopRequested) book.declined.push(`${t.name} ${summarize(t.name, call.args)}`);
+          log(`  tool ${call.tool} ${stopRequested ? "not run: stopped" : "declined by the user"}`);
         }
         if (stopRequested) break;
-        if (result.length > config.maxResult) result = result.slice(0, config.maxResult) + `\n…[${result.length - config.maxResult} more characters cut]`;
-        emit({ type: "result", tool: call.tool, text: result });
-        out = `${MARK} RESULT of ${call.tool}:\n${result}\n\nNext tool call (JSON only), or done; if this RESULT shows the step did not work, fix that first.`;
+        // Copilot gets the start and the end of a long result; the page gets all of it (up to 200 KB)
+        const shown = cutResult(result, config.maxResult, run?.n ?? 0);
+        emit({ type: "result", tool: call.tool, text: shown.text, run: run?.n, ...(shown.cut ? { full: result.slice(0, 200_000), total: result.length, head: shown.head, tail: shown.tail } : {}) });
+        out = resultMessage(call.tool, shown.text);
       }
-      emit({ type: "error", text: stopRequested ? "stopped" : `stopped after ${config.maxSteps} steps` });
+      emit({ type: "error", text: stopRequested ? "stopped" : `stopped after ${config.maxSteps} steps`, facts: toolRuns ? facts() : [] });
     }
   } finally {
     const known = new Set(chats.map((c) => c.id));
@@ -546,7 +557,7 @@ async function deleteAll() {
         const r = await bridge("delete", { id: c.id });
         if (!r.ok) { error = String(r.error); break; }
         deleted++;
-        await new Promise((ok) => setTimeout(ok, 3000)); // give Copilot time between deletes (it refuses ones that come too fast)
+        await new Promise((ok) => setTimeout(ok, 2000)); // give Copilot time between deletes (it refuses ones that come too fast; remove() also waits for the sidebar to settle)
       }
       if (deleted === before) break; // nothing went away: don't loop
     }
@@ -575,15 +586,20 @@ function json(res: http.ServerResponse, status: number, body?: unknown) {
   res.end(body === undefined ? "" : JSON.stringify(body));
 }
 
-http
+let port: number = config.port; // the port in use ("port": 0 in the config = any free one, for tests)
+const server = http
   .createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     // only this page may call the API (stops other sites open in your browser from posting tasks)
-    if (req.method === "POST" && req.headers.origin && req.headers.origin !== `http://127.0.0.1:${config.port}`) return json(res, 403);
+    if (req.method === "POST" && req.headers.origin && req.headers.origin !== `http://127.0.0.1:${port}`) return json(res, 403);
 
     if (req.method === "GET" && url.pathname === "/") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       return res.end(readFileSync(path.join(ROOT, "index.html")));
+    }
+    if (req.method === "GET" && url.pathname === "/agent-core.js") { // the page parses Copilot's replies with the server's own code
+      res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" });
+      return res.end(stripTypeScriptTypes(readFileSync(path.join(ROOT, "agent-core.ts"), "utf8")));
     }
     if (req.method === "GET" && url.pathname === "/api/events") {
       res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
@@ -715,10 +731,11 @@ http
       return json(res, 204);
     }
     json(res, 404);
-  })
-  .listen(config.port, "127.0.0.1", () => {
-    console.log(`M365 Agent → http://127.0.0.1:${config.port}   tools: ${[...tools.keys()].join(", ")}`);
-    log(`server start: node ${process.version}, port ${config.port}, copilot ${FAKE_BRIDGE ? `FAKE ${FAKE_BRIDGE}` : config.copilotUrl}, browser ${config.browser}`);
-    refreshChats();
-    setInterval(() => { if (!busy) refreshChats(true); }, 60_000); // keep the sidebar in sync, without reopening Copilot
   });
+server.listen(config.port, "127.0.0.1", () => {
+  port = (server.address() as { port: number }).port;
+  console.log(`M365 Agent → http://127.0.0.1:${port}   tools: ${[...tools.keys()].join(", ")}`);
+  log(`server start: node ${process.version}, port ${port}, copilot ${FAKE_BRIDGE ? `FAKE ${FAKE_BRIDGE}` : config.copilotUrl}, browser ${config.browser}`);
+  refreshChats();
+  setInterval(() => { if (!busy) refreshChats(true); }, 60_000); // keep the sidebar in sync, without reopening Copilot
+});

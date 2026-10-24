@@ -1,19 +1,19 @@
-import { readdirSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { fullPath, pathWarning, trustedForRead, type Tool } from "./_lib.ts";
+import { fullPath, isSkippedDir as skipped, pathWarning, trustedForRead, type Tool } from "./_lib.ts";
 
-const SKIP = new Set(["node_modules", "venv", "__pycache__", "dist", "build", "test-results", "playwright-report", "backups"]);
-const KEEP_DOT = new Set([".github", ".vscode", ".husky"]); // other dot-folders (.git, .venv, profiles, caches) are skipped
-const skipped = (name: string) => SKIP.has(name) || (name.startsWith(".") && !KEEP_DOT.has(name));
 const MAX = 400;
+// a file's size, so Copilot can tell what fits in one read_file (or a batch) before asking for it
+const size = (file: string) => { try { const b = statSync(file).size; return b < 1024 ? `${b} B` : b < 1024 * 1024 ? `${Math.round(b / 1024)} KB` : `${(b / 1024 / 1024).toFixed(1)} MB`; } catch { return ""; } };
 
 const tool: Tool = {
   name: "list_dir",
   description:
     'List a folder anywhere on the PC (workspace path or absolute path; outside the trusted folders needs approval). ' +
-    'Folders end with /. recursive: true lists the whole tree (skips node_modules, .git, .venv, build output) to understand a repo.',
+    'Folders end with /, files show their size. recursive: true lists the whole tree (skips node_modules, .git, .venv, build output) to understand a repo.',
   args: '{"path": "C:/devl/my-repo", "recursive": true}',
   approvalHint: "your folders run on their own; elsewhere asks first",
+  readOnly: true,
   needsApproval: (args, ctx) => !trustedForRead(fullPath(args.path, ctx), ctx),
   // a folder rule: the listed folder itself
   alwaysRule: (args, ctx) => {
@@ -26,19 +26,21 @@ const tool: Tool = {
   },
   run: async (args, ctx) => {
     const root = fullPath(args.path, ctx);
+    const entry = (dir: string, e: { name: string; isDirectory: () => boolean; isSymbolicLink: () => boolean }, rel = e.name) =>
+      e.isSymbolicLink() ? `${rel} (link)` : e.isDirectory() ? `${rel}/` : `${rel}  ${size(path.join(dir, e.name))}`;
     if (!args.recursive) {
-      return readdirSync(root, { withFileTypes: true }).map((e) => (e.isDirectory() ? `${e.name}/` : e.name)).join("\n") || "(empty folder)";
+      return readdirSync(root, { withFileTypes: true }).map((e) => entry(root, e)).join("\n") || "(empty folder)";
     }
     const out: string[] = [];
     const walk = (dir: string) => {
       for (const e of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
         if (out.length >= MAX) return;
         const rel = path.relative(root, path.join(dir, e.name)).replace(/\\/g, "/");
-        if (e.isDirectory()) {
+        if (e.isDirectory() && !e.isSymbolicLink()) {
           if (skipped(e.name)) { out.push(`${rel}/ (skipped)`); continue; }
           out.push(`${rel}/`);
           walk(path.join(dir, e.name));
-        } else out.push(rel);
+        } else out.push(entry(dir, e, rel));
       }
     };
     walk(root);

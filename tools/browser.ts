@@ -3,6 +3,7 @@
 // Copilot reads a numbered list of the page's controls and picks one by id. Evidence screenshots are full-screen
 // snaps like a tester's: the browser window brought to the front, the taskbar included, a red box around the control
 // (or page_only: just the page), saved in the workspace for reports.
+import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { chromium, type BrowserContext, type Locator, type Page } from "playwright-core";
 import { nextScreenshot, screenDriver, type Tool, type ToolContext } from "./_lib.ts";
@@ -76,6 +77,73 @@ async function listControls(p: Page, filter: string): Promise<string[]> {
 
 function target(p: Page, t: string): Locator {
   return /^e\d+$/.test(t) ? p.locator(`[data-agent="${t}"]`).first() : p.getByText(t, { exact: false }).first();
+}
+
+// The whole page as text, one line per element that matters (landmarks, headings, text, links, buttons, boxes),
+// indented like the page's structure, with the same eN ids elements gives, so Copilot can see where a control sits
+// and what is around it when the controls list alone is not enough. Saved in the workspace (pages/<name>.txt): long
+// pages are read in parts with read_file or searched with search_files.
+async function domText(p: Page): Promise<{ text: string; controls: number }> {
+  await listControls(p, ""); // tags the controls with data-agent ids first
+  return p.evaluate(() => {
+    const INTERACTIVE = 'a[href],button,input:not([type=hidden]),textarea,select,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=option],[role=checkbox],[role=radio],[role=switch],[role=combobox],[role=textbox],[role=searchbox],[contenteditable=""],[contenteditable=true],[onclick]';
+    const LANDMARK: Record<string, string> = { nav: "nav", main: "main", header: "header", footer: "footer", form: "form", aside: "aside", section: "section", article: "article", dialog: "dialog", table: "table", ul: "list", ol: "list", li: "item", tr: "row", th: "cell", td: "cell" };
+    const clean = (s: string | null | undefined) => (s ?? "").replace(/\s+/g, " ").trim();
+    const lines: string[] = [];
+    let controls = 0;
+    const visible = (el: Element) => {
+      const st = getComputedStyle(el);
+      if (st.display === "none" || st.visibility === "hidden") return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 || r.height > 0 || el.childElementCount > 0;
+    };
+    const walk = (el: Element, depth: number) => {
+      if (lines.length > 4000) return;
+      const tag = el.tagName.toLowerCase();
+      if (["script", "style", "noscript", "svg", "template", "head"].includes(tag) || !visible(el)) return;
+      const pad = "  ".repeat(Math.min(depth, 12));
+      const id = el.getAttribute("data-agent");
+      const role = el.getAttribute("role");
+      const r = el.getBoundingClientRect();
+      const off = r.bottom < 0 || r.top > innerHeight ? " (off-screen)" : "";
+      let line = "";
+      if (el.matches(INTERACTIVE)) {
+        controls++;
+        const kind = role ?? (tag === "a" ? "link" : tag === "button" || tag === "summary" ? "button" : tag === "select" ? "select" : tag === "input" ? (el.getAttribute("type") || "text") : tag);
+        const name = clean(el.getAttribute("aria-label") || (el as HTMLElement).innerText || el.getAttribute("placeholder") || el.getAttribute("title") || el.getAttribute("value") || el.getAttribute("name") || el.id).slice(0, 80);
+        const href = tag === "a" ? ` → ${(el as HTMLAnchorElement).getAttribute("href")?.slice(0, 100) ?? ""}` : "";
+        const state = (el as HTMLInputElement).checked ? " [checked]" : (el as HTMLInputElement).disabled ? " [disabled]" : "";
+        line = `${pad}${kind} "${name}"${id ? ` [${id}]` : ""}${href}${state}${off}`;
+      } else if (/^h[1-6]$/.test(tag)) {
+        line = `${pad}${tag} "${clean((el as HTMLElement).innerText).slice(0, 120)}"${off}`;
+      } else if (tag === "img") {
+        const alt = clean(el.getAttribute("alt") || el.getAttribute("title"));
+        if (alt) line = `${pad}img "${alt.slice(0, 80)}"`;
+      } else if (LANDMARK[tag] || (role && ["dialog", "alertdialog", "navigation", "main", "region", "tablist", "menu", "list", "listitem", "row", "cell", "grid", "table", "alert", "status"].includes(role))) {
+        const label = clean(el.getAttribute("aria-label") || el.getAttribute("title") || el.id);
+        line = `${pad}[${role ?? LANDMARK[tag]}${label ? ` "${label.slice(0, 60)}"` : ""}]${off}`;
+      } else {
+        // the element's own text (not its children's), so each piece of text appears once, where it is
+        const own = clean([...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join(" "));
+        if (own) line = `${pad}"${own.slice(0, 160)}"${off}`;
+      }
+      if (line) lines.push(line);
+      if (el.matches(INTERACTIVE) && tag !== "form") return; // a control's insides are its label
+      for (const c of el.children) walk(c, line ? depth + 1 : depth);
+    };
+    walk(document.body, 0);
+    return { text: lines.join("\n"), controls };
+  });
+}
+
+// A click that gets through: a normal click, then (something over the element, or it is not where the browser
+// thinks) a forced click, then the element's own click handler. Says which one it took.
+async function robustClick(loc: Locator): Promise<string> {
+  if (await loc.click({ timeout: 8000 }).then(() => true, () => false)) return "";
+  await loc.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+  if (await loc.click({ force: true, timeout: 3000 }).then(() => true, () => false)) return "needed a forced click: something was over it or it was not visible";
+  if (await loc.dispatchEvent("click", undefined, { timeout: 3000 }).then(() => true, () => false)) return "the normal click did not land, its click event was sent directly: check the page state";
+  throw new Error("could not click it: not visible, covered, or gone. Run elements or dom again and pick the right control, scroll to it first, or close what covers it");
 }
 
 // The browser window maximized (and restored first if minimized), so a red box placed now stays where it belongs
@@ -182,7 +250,10 @@ const tool: Tool = {
   description:
     "Drive my Microsoft Edge in its own window (its own profile: sites I signed in to there stay signed in). Actions: " +
     "open {url, new_tab?: true} (new_tab keeps the current page in its tab) · tabs lists the tabs, tabs {index} switches " +
-    "to one · elements {filter?} lists the page's controls as e1, e2 ... · click {target: \"e5\", evidence?: true} · " +
+    "to one · elements {filter?} lists the page's controls as e1, e2 ... · dom {name?} saves the WHOLE page as text " +
+    "(structure, headings, texts, every control with its eN id) in pages/<name>.txt and returns its start: use it when " +
+    "elements is not enough to know what to click or to check what the page shows; read the rest with read_file or " +
+    "search_files · click {target: \"e5\", evidence?: true} (a covered control gets a forced click; the result says so) · " +
     "type {target, text, enter?: true, evidence?: true} · select {target, option} · screenshot {target?, highlight?: " +
     "[texts], name?, page_only?: true} · read {chars?} page text · back · close. Run elements again after the page " +
     "changes. Evidence and screenshots are full-screen snaps for manual-testing reports: the browser window brought " +
@@ -246,12 +317,24 @@ async function act(action: string, args: Record<string, any>, ctx: ToolContext):
       const lines = await listControls(p, String(args.filter ?? ""));
       return `${await where(p)}${await signInNote(p)}\n${lines.join("\n") || "(no matching controls)"}`;
     }
+    case "dom": {
+      const { text, controls } = await domText(p);
+      const dir = path.join(ctx.workspace, "pages");
+      mkdirSync(dir, { recursive: true });
+      const name = (String(args.name ?? "").replace(/[^\w.-]+/g, "_") || `page-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`).replace(/\.txt$/i, "") + ".txt";
+      const file = path.join(dir, name);
+      writeFileSync(file, `${await where(p)}\n${text}\n`, "utf8");
+      const lines = text.split("\n").length;
+      const head = text.slice(0, 5000);
+      return `${await where(p)}${await signInNote(p)}\nsaved pages/${name} (${lines} lines, ${controls} controls with eN ids; click/type/select take those ids)` +
+        `\n${head}${text.length > head.length ? `\n…[${lines - head.split("\n").length} more lines: read_file pages/${name} with start_line, or search_files {"path": "pages", "text": "..."}]` : ""}`;
+    }
     case "click":
     case "type":
     case "select": {
       if (!args.target) return 'give a target: an id from elements ("e5") or the visible text';
       const loc = target(p, String(args.target));
-      if (!(await loc.count())) return `no element ${args.target} on the page; run elements again`;
+      if (!(await loc.count())) return `no element ${args.target} on the page: run elements (or dom for the whole page) again and use an id from it`;
       if (action === "type" && (await loc.getAttribute("type", { timeout: 1500 }).catch(() => ""))?.toLowerCase() === "password") {
         return "not typed: that is a password box. The user signs in themselves: use ask_user to ask them, then wait.";
       }
@@ -259,7 +342,8 @@ async function act(action: string, args: Record<string, any>, ctx: ToolContext):
       const proofOpts = { pageOnly: !!args.page_only, name: args.name };
       let proof = before ? await screenshot(p, ctx, loc, proofOpts) : "";
       const urlBefore = p.url();
-      if (action === "click") await loc.click({ timeout: 8000 });
+      let how = "";
+      if (action === "click") how = await robustClick(loc);
       else if (action === "select") await loc.selectOption({ label: String(args.option ?? args.text ?? "") }, { timeout: 8000 });
       else {
         await loc.fill(String(args.text ?? ""), { timeout: 8000 });
@@ -274,7 +358,7 @@ async function act(action: string, args: Record<string, any>, ctx: ToolContext):
         proof = await screenshot(p, ctx, still, proofOpts);
       }
       return `${action === "click" ? "clicked" : action === "select" ? "selected in" : "typed into"} ${args.target}` +
-        `${state ? ` (${state})` : ""} → ${await where(p)}` + (proof ? `\nevidence: ${proof}` : "") + (await signInNote(p));
+        `${state ? ` (${state})` : ""}${how ? ` (${how})` : ""} → ${await where(p)}` + (proof ? `\nevidence: ${proof}` : "") + (await signInNote(p));
     }
     case "screenshot": {
       const loc = args.target ? target(p, String(args.target)) : null;
@@ -293,7 +377,7 @@ async function act(action: string, args: Record<string, any>, ctx: ToolContext):
       return `back → ${await where(p)}${await signInNote(p)}`;
     }
     default:
-      return `unknown action "${action}"; use open, tabs, elements, click, type, select, screenshot, read, back or close`;
+      return `unknown action "${action}"; use open, tabs, elements, dom, click, type, select, screenshot, read, back or close`;
   }
 }
 export default tool;
