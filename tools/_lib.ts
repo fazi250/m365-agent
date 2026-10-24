@@ -1,6 +1,6 @@
 // Shared types and helpers for tools. Files in tools/ whose name starts with "_" are not loaded as tools.
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -9,6 +9,7 @@ export type ToolContext = {
   projects: string[]; // folders holding your repos: the agent may create and change files in them (asks first)
   readRoots: string[]; // folders read_file / list_dir may look into (workspace and projects included)
   root: string; // the project folder
+  configDir?: string; // the folder of the config.json in use (approvals.json lives next to it); default: root
   python: string; // the project's venv Python (.venv), for the document tools
   pythonIndexUrl: string; // your organization's PyPI mirror (Artifactory ...) for pip installs; "" = PyPI / pip's own settings
   browserChannel: string; // "chrome" or "msedge"
@@ -25,13 +26,17 @@ export type Tool = {
   needsApproval: (args: Record<string, any>, ctx: ToolContext) => boolean; // true: wait for Allow / Deny in the page
   approvalHint?: string; // shown in the page when approval depends on the args
   // what "Always allow" remembers for a call: calls with the same key run without asking again.
-  // Keep it narrow (an exact command, one host). Default: the exact args.
-  alwaysRule?: (args: Record<string, any>, ctx: ToolContext) => { key: string; label: string };
+  // Keep it narrow (an exact command, one host). Default: the exact args. null: no Always allow for this call (the
+  // page shows Allow once / Deny only), e.g. a protected path or a flagged command.
+  alwaysRule?: (args: Record<string, any>, ctx: ToolContext) => { key: string; label: string } | null;
   // optional "Allow for this task": calls with the same key run without asking until the current task ends
   // (e.g. every file written in one repo folder while the agent builds it)
   taskRule?: (args: Record<string, any>, ctx: ToolContext) => { key: string; label: string };
   // optional red line on the approval card (e.g. "SENSITIVE FILE", "outside your trusted folders")
   warning?: (args: Record<string, any>, ctx: ToolContext) => string | null;
+  // optional red flag lines for a command or script (downloads, deletes, encoded commands, ...; see commandFlags):
+  // information for the user, and with any flag Always allow is not offered
+  flags?: (args: Record<string, any>, ctx: ToolContext) => string[];
   // the tool runs code (a command, a script): while files changed by the agent are waiting for Keep / Undo, it asks
   // even if you chose Always allow, since it could run that unreviewed code
   runsCode?: boolean;
@@ -104,10 +109,18 @@ function killTree(p: ChildProcess) {
   else p.kill();
 }
 
-// Stop in the page: ends every program a tool is running now; their steps finish with "[stopped]".
-export function stopProcesses(): number {
-  for (const p of running) { stopped.add(p); killTree(p); }
-  return running.size;
+// Stop in the page: ends every program a tool is running now (with what it started); their steps finish with
+// "[stopped by the user]". Reports what it ended ("powershell 23456") and what was still there 2 s later.
+export async function stopProcesses(): Promise<{ ended: string[]; stillRunning: string[] }> {
+  const ended: string[] = [], stillRunning: string[] = [];
+  await Promise.all([...running].map(async (p) => {
+    stopped.add(p);
+    const name = `${path.basename(p.spawnfile).replace(/\.exe$/i, "")} ${p.pid ?? "?"}`;
+    const gone = new Promise<boolean>((resolve) => { p.once("close", () => resolve(true)); setTimeout(() => resolve(false), 2000); });
+    killTree(p);
+    ((await gone) || p.exitCode != null) ? ended.push(name) : stillRunning.push(name);
+  }));
+  return { ended, stillRunning };
 }
 
 // Runs a program with an argument list (no shell in between) and returns stdout + stderr (decoded as UTF-8).
@@ -248,16 +261,64 @@ const SENSITIVE = [
 ];
 export const isSensitive = (full: string) => SENSITIVE.some((re) => re.test(full));
 
-// the approval card's warning line for a path, or null
-export function pathWarning(full: string, trusted: boolean): string | null {
-  const parts = [];
-  if (isSensitive(full)) parts.push("SENSITIVE FILE (keys, passwords or tokens may be in it)");
-  if (!trusted) parts.push("outside your trusted folders");
-  return parts.length ? `${parts.join(", ")}: what is read goes into the Copilot chat` : null;
+// ── the agent's own files: protected paths always ask, with a red reason and no Always allow, even inside a trusted
+//    folder (config.json puts the agent's own repo under projects). Writing its code or settings changes what runs at
+//    the next start; a tampered Keep / Undo store turns Undo into an arbitrary write; .git hooks run at the next git
+//    command; a browser profile holds signed-in cookies and tokens. ──
+// the path as Windows will open it: trailing dots and spaces dropped from each segment, the deepest existing ancestor
+// through realpath (8.3 names, letter case, junctions), so "approvals.json." or "M365-A~1" cannot slip past
+export function canonicalPath(full: string): string {
+  const parsed = path.parse(path.resolve(full));
+  const segs = parsed.dir.slice(parsed.root.length).split(/[\\/]/).concat(parsed.base).filter(Boolean).map((s) => s.replace(/[. ]+$/, "") || s);
+  let known = parsed.root, i = 0;
+  for (; i < segs.length; i++) {
+    const next = path.join(known, segs[i]);
+    if (!existsSync(next)) break;
+    known = next;
+  }
+  try { known = realpathSync.native(known); } catch { /* keep the resolved spelling */ }
+  return path.join(known, ...segs.slice(i));
+}
+const underDir = (full: string, dir: string) => inside(full, canonicalPath(dir));
+const PROFILE = /[\\/](\.copilot-web-profile|\.browser-profile[^\\/]*)([\\/]|$)|[\\/]AppData[\\/]Local[\\/](Microsoft[\\/]Edge|Google[\\/]Chrome)[\\/]User Data([\\/]|$)/i;
+
+// why a path is protected for that verb, or null. Write: the agent's code (root outside the workspace), its config
+// and approvals, the Keep / Undo store, any .git segment, browser profiles. Read: the config (it can hold a token),
+// the trace and captures, the Keep / Undo store, the profiles; the agent's own source stays free to read.
+export function protectedPath(full: string, ctx: ToolContext, verb: "read" | "write"): string | null {
+  const p = canonicalPath(full);
+  const configDir = ctx.configDir ?? ctx.root;
+  const name = path.basename(p).toLowerCase();
+  const inDir = (dir: string) => path.dirname(p).toLowerCase() === canonicalPath(dir).toLowerCase();
+  if (PROFILE.test(p)) return "a signed-in browser profile (cookies and tokens)";
+  if (underDir(p, path.join(ctx.workspace, ".changes"))) return "the Keep / Undo store: a changed entry would make Undo write any file";
+  if (inDir(configDir) && (name === "config.json" || (verb === "write" && name === "approvals.json"))) {
+    return verb === "write" ? `the agent's own settings (${name}): a change takes effect at the next server start` : `the agent's own settings (${name}; it can hold a package index token)`;
+  }
+  if (verb === "write") {
+    if (/[\\/]\.git([\\/]|$)/i.test(p)) return "git hooks and config run code on the next git command";
+    if (underDir(p, ctx.root) && !underDir(p, ctx.workspace)) return "the agent's own code and settings: a change takes effect at the next server start";
+  } else {
+    if (/^agent\.log(\.old)?$/.test(name) && (inDir(ctx.root) || inDir(configDir))) return "the agent's own trace (what every chat did and saw)";
+    if (underDir(p, path.join(ctx.root, "diag"))) return "the agent's own captures (what other chats did and saw)";
+  }
+  return null;
 }
 
-// the narrow "Always allow" rule for a path: its folder, or the exact file when it is sensitive
-export function pathRule(full: string, verb: string): { key: string; label: string } {
+// the approval card's warning line for a path, or null. protectedWhy: protectedPath()'s reason; tail: what happens
+// with the file (default: it is read into the Copilot chat)
+export function pathWarning(full: string, trusted: boolean, o: { protectedWhy?: string | null; tail?: string } = {}): string | null {
+  const parts = [];
+  if (o.protectedWhy) parts.push(`PROTECTED, ${o.protectedWhy}`);
+  if (isSensitive(full)) parts.push("SENSITIVE FILE (keys, passwords or tokens may be in it)");
+  if (!trusted) parts.push("outside your trusted folders");
+  return parts.length ? `${parts.join("; ")}: ${o.tail ?? "what is read goes into the Copilot chat"}` : null;
+}
+
+// the narrow "Always allow" rule for a path: its folder, or the exact file when it is sensitive; none for a
+// protected path (ctx and verb given), which asks every time
+export function pathRule(full: string, verb: "reading" | "writing", ctx?: ToolContext): { key: string; label: string } | null {
+  if (ctx && protectedPath(full, ctx, verb === "reading" ? "read" : "write")) return null;
   return isSensitive(full)
     ? { key: `file:${full.toLowerCase()}`, label: `${verb} the file ${full}` }
     : { key: `dir:${path.dirname(full).toLowerCase()}`, label: `${verb} files in ${path.dirname(full)}` };
@@ -284,4 +345,54 @@ export function workingDir(p: string | undefined, ctx: ToolContext): string {
   const full = path.resolve(ctx.workspace, String(p));
   if ([ctx.workspace, ...ctx.projects].some((r) => inside(full, r))) return full;
   throw new Error(`${full} is outside the workspace and the projects folders`);
+}
+
+// ── red flag lines for a command or script (shell, run_python, process): what to look at twice before allowing.
+//    They are information, not a block: the step still runs when allowed, but Always allow is not offered. ──
+const FLAGS: [RegExp, string][] = [
+  [/\|\s*(iex|Invoke-Expression|powershell(\.exe)?|pwsh(\.exe)?|cmd(\.exe)?|sh|bash)\b|(^|[\s;(])(iex|Invoke-Expression)\b/im, "runs text as code (iex / Invoke-Expression / piped into a shell)"],
+  [/\b(iwr|curl|wget|Invoke-WebRequest|Invoke-RestMethod|DownloadString|DownloadFile|Start-BitsTransfer)\b/i, "downloads from the internet"],
+  [/\b(Remove-Item|rm|ri|del|erase)\b[^\n|;]*\s-(r|rf|Recurse)\b|(^|[\s;|(])(rd|rmdir)\s|\bdel\s+\/s\b|\bFormat-Volume\b|\bClear-Content\b|\bgit\s+(clean\s+-\w*f|reset\s+--hard|push\s[^\n;|]*(-f\b|--force)|checkout\s+--\s|restore\s|stash\s+drop|branch\s+-D\b)/im, "deletes or discards work; this cannot be undone"],
+  [/\breg(\.exe)?\s+(add|delete|import)\b|\bSet-ItemProperty\b[^\n]*\bHK(LM|CU)\b|\bNew-Service\b|\bsc(\.exe)?\s+create\b|\bschtasks\b|\bRegister-ScheduledTask\b|\bnetsh\b|\b(Set|Add)-MpPreference\b|\bSet-ExecutionPolicy\b|\bNew-NetFirewallRule\b/i, "changes Windows settings, Defender, the firewall, services or what runs at startup"],
+  [/\bStart-Process\b|-Verb\s+RunAs\b|\brunas\b/i, "starts another program, or asks for administrator rights"],
+];
+// after powershell / pwsh: -e, -en, ... -EncodedCommand (a base64 command nobody can read on the card)
+const ENCODED = new RegExp(`\\b(powershell|pwsh)(\\.exe)?\\b[^\\n|;]*\\s-e${"ncodedcommand".split("").reduceRight((rest, ch) => `(${ch}${rest})?`, "")}(\\s|$)`, "im");
+const PY_FLAGS: [RegExp, string][] = [
+  [/\b(subprocess|os\.system|os\.popen|os\.exec\w*|os\.spawn\w*)\b/, "runs other programs (subprocess / os.system)"],
+  [/\bshutil\.rmtree\b|\bos\.(remove|unlink|rmdir|removedirs)\b|\.unlink\(/, "deletes files or folders"],
+  [/\bwinreg\b/, "changes the Windows registry"],
+  [/(^|[^\w.])(exec|eval)\s*\(/m, "runs text as code (exec / eval)"],
+  [/\b(urllib|requests|httpx|urlopen|aiohttp)\b[\s\S]*\b(exec|eval|subprocess|os\.system)\b|\b(exec|eval|subprocess|os\.system)\b[\s\S]*\b(urllib|requests|httpx|urlopen|aiohttp)\b/, "downloads and runs"],
+];
+const WRITES = /\b(Set-Content|Out-File|Add-Content|Copy-Item|Move-Item|New-Item|Rename-Item|cp|mv|copy|move|mkdir|md|ni|tee)\b|(^|[^>])>{1,2}(?!&)/im;
+const PATHISH = /^[A-Za-z]:[\\/]|^\.{1,2}[\\/]|^~[\\/]|[\\/]/;
+const SWITCH = /^\/[A-Za-z][\w-]*$/; // a cmd-style option (/s, /create), not a path
+// quote-aware tokens of a command (quotes removed)
+export function commandTokens(text: string): string[] {
+  return (text.match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map((t) => t.replace(/^(["'])(.*)\1$/, "$2"));
+}
+/** flag lines for a PowerShell command or script (o.python: Python code); cwd resolves relative paths */
+export function commandFlags(text: string, ctx: ToolContext, o: { cwd?: string; python?: boolean } = {}): string[] {
+  const out: string[] = [];
+  if (!o.python && ENCODED.test(text)) out.push("runs an encoded command (base64 that nobody can read here)");
+  for (const [re, why] of o.python ? [...PY_FLAGS, ...FLAGS.slice(1)] : FLAGS) if (re.test(text)) out.push(why);
+  // tokens that are paths: a protected or sensitive one, or a write outside the trusted folders
+  let cwd = ctx.workspace;
+  try { cwd = o.cwd ? workingDir(o.cwd, ctx) : ctx.workspace; } catch { /* the tool refuses it anyway */ }
+  const writes = !o.python && WRITES.test(text);
+  const seen = new Set<string>();
+  for (const tok of commandTokens(text)) {
+    const t = tok.replace(/^[-/]+\w+[:=]/, "").replace(/[;,)]+$/, ""); // -Path:C:/x, "x," → the path
+    if (!PATHISH.test(t) || SWITCH.test(t) || /^[\\/]{2}|^[a-z][a-z0-9+.-]*:\/\//i.test(t) || t.length > 300) continue;
+    let full: string;
+    try { full = path.resolve(cwd, t.replace(/^~(?=[\\/])/, process.env.USERPROFILE ?? "~")); } catch { continue; }
+    if (seen.has(full.toLowerCase())) continue;
+    seen.add(full.toLowerCase());
+    const why = protectedPath(full, ctx, "write");
+    if (why) out.push(`names a protected path (${tok}): ${why}`);
+    else if (isSensitive(full)) out.push(`names a sensitive file (${tok}): keys, passwords or tokens may be in it`);
+    else if (writes && !trustedForWrite(full, ctx) && !/^[A-Za-z]:[\\/]?$/.test(full)) out.push(`may write outside your trusted folders (${tok})`);
+  }
+  return [...new Set(out)];
 }

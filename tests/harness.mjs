@@ -1,5 +1,6 @@
 // Test harness: starts server.ts with a scratch config (its own workspace, repo folder, approvals and log under
-// tests/.tmp/<name>/) and the fake Copilot (fake-bridge.mjs), listens to its events and talks to its API.
+// %TEMP%/m365-agent-tests/<name>-<pid>-<n>/, outside this repo, since writes inside the agent's own folder are
+// protected and would ask) and the fake Copilot (fake-bridge.mjs), listens to its events and talks to its API.
 //   const s = await startServer({ replies: [...], approvals: ["once"] });
 //   await s.post("/api/send", { message: "...", tools: ["list_dir"] });
 //   const done = await s.waitFor((e) => e.type === "done");
@@ -7,14 +8,16 @@
 //   await s.stop();
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const TMP = path.join(ROOT, "tests", ".tmp");
+export const TMP = path.join(os.tmpdir(), "m365-agent-tests");
 let seq = 0;
 
-export async function startServer({ replies = [], config = {}, approvals = [], name = "t" } = {}) {
+// rules: saved "Always allow" rules to start with, as a list or a function of { workspace, repo } (written to approvals.json)
+export async function startServer({ replies = [], config = {}, approvals = [], rules = [], name = "t" } = {}) {
   if (!seq) { // the scratch folders of earlier runs go; this run's stay for a look after a failure
     try { for (const d of readdirSync(TMP)) if (!d.includes(`-${process.pid}-`)) rmSync(path.join(TMP, d), { recursive: true, force: true }); } catch { /* no .tmp yet */ }
   }
@@ -29,6 +32,8 @@ export async function startServer({ replies = [], config = {}, approvals = [], n
   };
   const configFile = path.join(dir, "config.json");
   writeFileSync(configFile, JSON.stringify(cfg, null, 2));
+  const saved = typeof rules === "function" ? rules({ workspace, repo }) : rules;
+  if (saved.length) writeFileSync(path.join(dir, "approvals.json"), JSON.stringify(saved.map((r) => ({ added: new Date().toISOString(), ...r })), null, 2));
   const repliesFile = path.join(dir, "replies.json");
   writeFileSync(repliesFile, JSON.stringify(replies));
 
@@ -49,7 +54,8 @@ export async function startServer({ replies = [], config = {}, approvals = [], n
   // kept apart, so waiting for "idle" waits for a task's end)
   const events = [];
   const waiters = [];
-  const policy = [...approvals]; // decisions for approval cards, applied in order: "once" | "task" | "always" | "deny"
+  // decisions for approval cards, applied in order: "once" | "task" | "always" | "deny", or { decision, kind, reason }
+  const policy = [...approvals];
   const post = (p, body, headers = {}) => fetch(base + p, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body ?? {}) });
   const get = (p) => fetch(base + p);
   let first = true;
@@ -57,7 +63,7 @@ export async function startServer({ replies = [], config = {}, approvals = [], n
     if (first) { first = false; return; }
     events.push(ev);
     for (const w of [...waiters]) if (w.pred(ev)) { waiters.splice(waiters.indexOf(w), 1); w.resolve(ev); }
-    if (ev.type === "approve" && policy.length) post("/api/approve", { id: ev.id, decision: policy.shift() });
+    if (ev.type === "approve" && policy.length) { const p = policy.shift(); post("/api/approve", { id: ev.id, ...(typeof p === "string" ? { decision: p } : p) }); }
   };
   const sse = await fetch(base + "/api/events");
   const reader = sse.body.getReader();

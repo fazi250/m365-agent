@@ -11,6 +11,10 @@ export type Msg = { role: "user" | "copilot"; text: string };
 export type Result = {
   ok: boolean; error?: string; text?: string; chatId?: string; chats?: Chat[]; messages?: Msg[]; closed?: boolean; gone?: boolean; dryRun?: boolean;
   via?: "button" | "stable30" | "progress60"; // how a reply was taken as finished (ask): its Copy Response button, or text unchanged for 30 s / 60 s
+  // ask: where the round trip's time went, in ms (ready: the page; newChat; send: until the message was in the chat;
+  // first: until the reply's first text; button: until its Copy button; settle: until the text was seen unchanged;
+  // chatId: finding a new chat's id), so a slow laptop's timeouts can be told from a slow Copilot
+  timing?: Record<string, number>;
 };
 
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -286,7 +290,11 @@ export class CopilotWeb {
 
   async ask(message: string, newChat: boolean): Promise<Result> {
     if (!message.trim()) throw new Error("empty message");
+    const timing: Record<string, number> = {};
+    let markAt = Date.now();
+    const mark = (phase: string) => { const now = Date.now(); timing[phase] = now - markAt; markAt = now; };
     const p = await this.ready();
+    mark("ready");
     const articles = p.locator("[role=article]");
     if (this.authBroken()) await this.reauth(p);
     if (newChat) {
@@ -300,6 +308,7 @@ export class CopilotWeb {
       }
       if (await articles.count()) throw new Error("could not start a new chat in Copilot (nothing was sent)");
     }
+    mark("newChat");
     const chatsBefore = new Set((await this.chats(p)).map((c) => c.id));
     // New messages are told apart by their number in the chat (aria-posinset): higher than any before. Counting the
     // messages in the page is not enough, since Copilot can take messages far above the view out of the page.
@@ -370,6 +379,7 @@ export class CopilotWeb {
       if (this.authBroken()) await this.reauth(p);
       throw new Error("the message did not reach Copilot (nothing was sent; the Send button stayed off: is a dialog open in the Copilot window, or does Copilot show a notice?)");
     }
+    mark("send");
 
     // done = the new reply has its "Copy Response" button and its text stopped changing. A notice that never gets
     // that button is taken once unchanged for 30 s, unless it is a progress line ("Lining things up...": 60 s).
@@ -382,6 +392,8 @@ export class CopilotWeb {
       if (/limit/i.test(notice)) throw new Error(`Copilot: ${notice}`);
       const r = newOnes(await p.evaluate(readMessages), "copilot").at(-1);
       if (!r) continue;
+      if (!seen) mark("first"); // the reply's first text
+      if (r.done && timing.button == null) mark("button"); // its Copy button: the reply is complete
       if (r.done) await this.showCode(p); // Markdown / HTML blocks open as a preview: switch them to their code
       const text = r.done ? (newOnes(await p.evaluate(readMessages), "copilot").at(-1)?.text ?? r.text) : r.text;
       seen = { text, done: r.done };
@@ -392,7 +404,10 @@ export class CopilotWeb {
       if (progress && stable < 85) continue;
       if ((r.done && stable >= 1) || stable >= 43) {
         const via = r.done ? "button" : progress ? "progress60" : "stable30";
-        return { ok: true, text, chatId: await this.chatIdNow(p, chatsBefore), via };
+        mark("settle");
+        const chatId = await this.chatIdNow(p, chatsBefore);
+        mark("chatId");
+        return { ok: true, text, chatId, via, timing };
       }
     }
     throw new Error(`no reply from Copilot within ${timeout} s (${await this.whatWasThere(p, seen, notice)})`);

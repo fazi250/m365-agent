@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { syntaxCheck } from "./_check.ts";
-import { commandEnv, fullPath, runProcess, trustedForWrite, workingDir, type Tool, type ToolContext } from "./_lib.ts";
+import { commandEnv, commandFlags, fullPath, runProcess, trustedForWrite, workingDir, type Tool, type ToolContext } from "./_lib.ts";
 
 const fwd = (p: string) => p.replace(/\\/g, "/");
 // with code: always scripts/<name>.py in the workspace (the only place this tool writes; a repo file is changed with
@@ -51,9 +51,22 @@ const tool: Tool = {
     const check = await syntaxCheck("script.py", ctx, String(args.code));
     return check.status === "error" ? `not run: ${String(args.path ?? `scripts/${args.name ?? "script"}.py`)} has a ${check.text.split("\n")[0]}; fix the code and send it again` : null;
   },
+  // red lines on the card for the code that will run (sent now, or the script file named by path)
+  flags: (args, ctx) => {
+    if (moduleOf(args)) return [];
+    let code = args.code != null ? String(args.code) : "";
+    if (!code) { try { code = readFileSync(scriptFile(args, ctx), "utf8"); } catch { return []; } }
+    return commandFlags(code, ctx, { cwd: args.cwd, python: true });
+  },
+  // "Allow for this task": this exact script (or module call) again until the task ends; a changed script asks again
+  taskRule: (args, ctx) => {
+    const rule = tool.alwaysRule!(args, ctx);
+    return rule && { key: rule.key, label: `running ${rule.label} again in this task` };
+  },
   // remembered by content: the same script text (or module), arguments and folder run again without asking;
-  // a changed script asks again
+  // a changed script asks again; a flagged script asks every time
   alwaysRule: (args, ctx) => {
+    if (tool.flags!(args, ctx).length) return null;
     const mod = moduleOf(args);
     let code = args.code != null ? String(args.code) : "";
     if (!mod && args.code == null) {

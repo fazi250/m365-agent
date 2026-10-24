@@ -76,6 +76,11 @@
   .seg button { border: none; border-radius: 0; padding: 4px 14px; background: transparent; }
   .seg button[aria-checked="true"] { background: var(--accent); color: var(--accent-text); }
   #tools.off { opacity: .45; pointer-events: none; }
+  .procs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; font-size: 13px; }
+  .proc { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 8px; padding: 2px 8px; max-width: 100%; }
+  .proc code { font: 12px ui-monospace, Consolas, monospace; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .proc.ended { color: var(--err); }
+  .proc button, .procs > button { padding: 1px 8px; font-size: 12px; }
   #changes { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 20px; max-height: 45vh; overflow-y: auto; }
   .changes-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .changes-head .hint { margin: 0; }
@@ -110,7 +115,9 @@
   .call-name { font-weight: 600; }
   .why { color: var(--muted); font-size: 13px; }
   pre { margin: 6px 0 0; padding: 8px 10px; background: var(--mono-bg); border-radius: 6px; font: 12.5px/1.45 ui-monospace, Consolas, monospace; white-space: pre-wrap; max-height: 280px; overflow: auto; }
-  .actions { display: flex; gap: 8px; margin-top: 8px; align-items: center; font-size: 13px; color: var(--muted); }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; align-items: center; font-size: 13px; color: var(--muted); }
+  .actions button { white-space: nowrap; }
+  .actions input { flex: 1; min-width: 180px; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
 
   form { display: flex; gap: 8px; padding: 12px 20px 16px; border-top: 1px solid var(--line); background: var(--panel); }
   textarea { flex: 1; resize: none; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-height: 46px; max-height: 180px; }
@@ -143,6 +150,7 @@
         <span class="hint" id="modeHint"></span>
       </div>
       <div id="tools"></div>
+      <div id="procs" class="procs" hidden></div>
     </div>
     <div id="log"></div>
     <dialog id="rulesDlg">
@@ -167,7 +175,7 @@
   </main>
 </div>
 <script type="module">
-import { MARK, parseCall as parseReply } from "/agent-core.js"; // the server's own parser for Copilot's replies
+import { BATCH_PART_RE, MARK, RESULT_RE, RESULT_RE_OLD, parseCall as parseReply } from "/agent-core.js"; // the server's own parser for Copilot's replies
 const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input");
 let chats = [], viewing = null, busy = false, statusEl = null, rules = [];
@@ -209,21 +217,23 @@ function argsText(a) {
   if (block && !Object.keys(a).length) return "";
   return JSON.stringify(a, null, 2);
 }
-function callCard(call) {
+// ev: the live event (batch: "1/3" for a call inside a batch; tainted: a RESULT earlier in the task looked like instructions)
+function callCard(call, ev = {}) {
   const d = add(el("div", "msg"));
   const head = el("div");
-  head.append(el("span", "call-name", call.tool), document.createTextNode(" "), el("span", "why", call.why ? "— " + call.why : ""));
+  head.append(el("span", "call-name", call.tool + (ev.batch ? ` (batch ${ev.batch})` : "")), document.createTextNode(" "), el("span", "why", call.why ? "— " + call.why : ""));
   d.append(head);
   const text = argsText(call.args), block = blockOf(call.args);
   if (text) d.append(pre(text));
   if (block) d.append(el("div", "label", block.label), pre(block.text));
+  if (ev.tainted) d.append(el("div", "warn-note", "⚠ an earlier result in this task looked like instructions to Copilot: check that this call is for your request"));
   return d;
 }
 // a tool's result; a command's trailer line ([exit 0, 2.3 s] / [exit code 1, 14.2 s] / killed / stopped) becomes a
 // pill, and a result Copilot saw cut in the middle shows in full, with a note on what Copilot got
 function resultCard(tool, text, ev) {
   const d = add(el("div", "msg"));
-  const label = el("div", "label", "result · " + tool);
+  const label = el("div", "label", "result · " + tool + (ev?.batch ? ` (batch ${ev.batch})` : ""));
   const end = String(text ?? "").trimEnd().split("\n").at(-1).match(/^\[(exit 0|exit code \d+|killed[^\],]*|stopped[^\],]*)(?:, ([\d.]+ s))?\]$/);
   if (end) label.append(el("span", "pill " + (end[1] === "exit 0" ? "ok" : "err"), end[1] + (end[2] ? " · " + end[2] : "")));
   d.append(label, pre(ev?.full ?? text));
@@ -255,36 +265,143 @@ function doneCard(text, checks, facts, warning) {
   factsList(d, facts, warning);
 }
 
+// a diff as the Files changed list and the approval card show it: unchanged runs longer than 6 lines collapse to
+// their first and last 2 lines
+function diffView(lines, more = 0) {
+  const view = el("pre", "diff");
+  for (let i = 0; i < lines.length;) {
+    if (lines[i].t !== " ") { view.append(el("span", lines[i].t === "+" ? "add" : "del", lines[i].t + " " + lines[i].s)); i++; continue; }
+    let j = i; while (j < lines.length && lines[j].t === " ") j++;
+    const run = lines.slice(i, j);
+    const show = run.length > 6 ? [...run.slice(0, 2), null, ...run.slice(-2)] : run;
+    for (const l of show) view.append(l ? el("span", "", "  " + l.s) : el("span", "gap", `  … ${run.length - 4} unchanged lines`));
+    i = j;
+  }
+  if (more) view.append(el("span", "gap", `  … ${more} more lines not shown`));
+  return view;
+}
+
+// ── attention: while a card waits for you, the tab title and icon say so (a notification too, if you allowed them) ──
+const BASE_TITLE = document.title;
+const attention = new Map(); // card id → kind ("approve" | "question")
+let iconBefore = null;
+function setAttention(id, kind) {
+  if (kind) attention.set(id, kind); else attention.delete(id);
+  const kinds = [...attention.values()];
+  const link = document.querySelector("link[rel~='icon']") || document.head.appendChild(Object.assign(el("link"), { rel: "icon" }));
+  if (iconBefore == null) iconBefore = link.href || "";
+  if (!kinds.length) { document.title = BASE_TITLE; link.href = iconBefore || "data:,"; return; }
+  document.title = kinds.includes("approve") ? "⏳ Allow? — M365 Agent" : "❓ Copilot is asking you";
+  const c = Object.assign(el("canvas"), { width: 32, height: 32 }), g = c.getContext("2d");
+  g.fillStyle = kinds.includes("approve") ? "#e3a344" : "#5b8ff0"; g.beginPath(); g.arc(16, 16, 12, 0, 7); g.fill();
+  link.href = c.toDataURL();
+  if (kind && typeof Notification !== "undefined" && Notification.permission === "granted" && document.hidden) {
+    try { new Notification(document.title, { body: kind === "approve" ? "Copilot wants to run a step: check it first." : "Copilot has a question for you.", tag: id }); } catch { /* not available */ }
+  }
+}
+// a card was answered in this tab or another one: show the outcome and drop the buttons
+function closeCard(id, text) {
+  const card = document.querySelector(`.msg[data-id="${id}"]`);
+  const rows = card ? [...card.querySelectorAll(".actions")] : [];
+  rows.forEach((row, i) => (i ? row.remove() : row.replaceChildren(el("span", "", text)))); // one outcome line, the Deny row goes
+  setAttention(id, null);
+}
+
 // Copilot's ask_user: the task waits until you answer here (Continue with an empty box = "done, go on")
-let titleBefore = null;
 function questionCard(ev) {
+  if (document.querySelector(`.msg[data-id="${ev.id}"]`)) return; // shown already (a reload re-sent it)
   const d = add(el("div", "msg question"));
+  d.dataset.id = ev.id;
   d.append(el("div", "label", "Copilot is asking you. The task waits for your answer."), el("div", "q", ev.text));
   const row = el("div", "actions");
   const input = el("input");
-  input.placeholder = "Your answer (or leave empty and press Continue when the step is done)";
+  input.placeholder = "Your answer goes into the Copilot chat (no passwords or codes); leave empty and press Continue when the step is done";
   const go = el("button", "primary", "Continue");
   const answer = async () => {
     go.disabled = input.disabled = true;
     const text = input.value.trim();
     const r = await post("/api/answer", { id: ev.id, text });
-    row.replaceChildren(el("span", "", r.ok ? (text ? "answered: " + text : "continued") : "this question is closed (answered or stopped)"));
-    if (titleBefore != null) { document.title = titleBefore; titleBefore = null; }
+    closeCard(ev.id, r.ok ? (text ? "answered: " + text : "continued") : "this question is closed (answered or stopped)");
   };
   go.onclick = answer;
   input.onkeydown = (e) => { if (e.key === "Enter") answer(); };
   row.append(input, go);
   d.append(row);
   input.focus();
-  if (titleBefore == null) { titleBefore = document.title; document.title = "❓ Copilot is asking you"; }
+  setAttention(ev.id, "question");
+}
+
+// Copilot wants to run a step that needs your OK: the call (a write as a diff, code as code), red warning and flag
+// lines, then Allow once / Allow for this task / Always allow / Deny. Deny asks what kind of no it is, so Copilot is
+// told the right thing (fix the step, skip that part, or no other way without asking) and can take a reason.
+function approveCard(ev) {
+  if (document.querySelector(`.msg[data-id="${ev.id}"]`)) return;
+  const d = add(el("div", "msg"));
+  d.dataset.id = ev.id;
+  d.append(el("div", "label", "Copilot wants to run this. Check it first."), el("div", "call-name", ev.call.tool));
+  const text = argsText(ev.call.args), block = blockOf(ev.call.args);
+  if (text) d.append(pre(text));
+  if (ev.show?.kind === "diff") {
+    d.append(el("div", "label", `change to ${ev.show.path} (− current, + after this step)`), diffView(ev.show.lines, ev.show.more));
+    if (block) { const whole = el("button", "", "Show the whole content"); whole.onclick = () => { whole.replaceWith(el("div", "label", block.label), pre(block.text)); }; d.append(whole); }
+  } else {
+    if (ev.show?.kind === "note") d.append(el("div", "warn-note", ev.show.text));
+    if (block) d.append(el("div", "label", block.label), pre(block.text));
+  }
+  if (ev.warning) d.append(el("div", "warn-note", "⚠ " + ev.warning));
+  for (const f of ev.flags ?? []) d.append(el("div", "warn-note", "⚑ " + f));
+  const row = el("div", "actions");
+  const once = el("button", "primary", "Allow once"), deny = el("button", "", "Deny");
+  const always = ev.always ? el("button", "", "Always allow") : null; // null: a protected path, a flagged command or a script asks every time
+  const task = ev.task ? el("button", "", "Allow for this task") : null;
+  if (always) always.title = "Don't ask again for " + ev.always;
+  if (task) task.title = "Don't ask again for " + ev.task;
+  const buttons = [once, task, always, deny].filter(Boolean);
+  const answer = async (decision, text, extra = {}) => {
+    buttons.forEach((b) => (b.disabled = true));
+    const r = await post("/api/approve", { id: ev.id, decision, ...extra });
+    closeCard(ev.id, r.ok ? text : "this card is closed (answered elsewhere or stopped)");
+  };
+  once.onclick = () => answer("once", "allowed once");
+  if (task) task.onclick = () => answer("task", "allowed for this task");
+  if (always) always.onclick = () => answer("always", "allowed, and saved");
+  // Deny: say what kind of no it is (and why, if you like); Copilot gets the matching instruction
+  deny.onclick = () => {
+    buttons.forEach((b) => (b.disabled = true));
+    const why = el("input"); why.placeholder = "why (optional; goes to Copilot)";
+    const kinds = [["fix", "wrong command or path", "Copilot corrects this step and proposes it again"], ["skip", "skip this part", "Copilot leaves this part out and says so in done"],
+      ["ask", "not like this; ask me before trying another way", "Copilot must not do the same thing another way without asking"], ["stop", "stop the task", "ends the task now"]];
+    const chips = kinds.map(([kind, label, title]) => { const b = el("button", "", label); b.title = title; b.onclick = () => answer("deny", `denied (${label})${why.value.trim() ? ": " + why.value.trim() : ""}`, { kind, reason: why.value.trim() }); return b; });
+    why.onkeydown = (e) => { if (e.key === "Enter") chips[2].click(); };
+    const back = el("button", "", "Back"); back.onclick = () => { buttons.forEach((b) => (b.disabled = false)); denyRow.remove(); };
+    const denyRow = el("div", "actions"); denyRow.append(el("span", "", "Deny:"), why, ...chips, back);
+    d.append(denyRow);
+    why.focus();
+  };
+  row.append(...buttons);
+  d.append(row);
+  if (ev.unkept) d.append(el("div", "always-note", `${ev.unkept} changed file(s) are not kept yet, so this asks even if you allowed it before: it may run that code.`));
+  if (ev.task) d.append(el("div", "always-note", "Allow for this task = runs again without asking until your next message, also after Copilot changes more files (it may run code you have not kept yet)."));
+  d.append(el("div", "always-note", ev.always ? "Always allow = never ask again for " + ev.always : ev.flags?.length ? "Always allow is not offered for flagged commands: this asks every time." : "Always allow is not offered for this step: it asks every time."));
+  setAttention(ev.id, "approve");
 }
 
 // a message as stored in Copilot (history) → the same cards the live view shows
 function renderStored(m) {
   if (m.role === "user") {
-    if (m.text.startsWith(MARK)) { // a server message (a RESULT may itself hold a line starting with the marker)
-      const r = m.text.match(/^\[local-agent\] RESULT of (\S+):\s*\n([\s\S]*?)\n\s*Next tool call/);
-      if (r) return resultCard(r[1], r[2]);
+    if (m.text.startsWith(MARK)) { // a server message (a RESULT may itself hold a line starting with the marker: quoted with a backslash)
+      const r = m.text.match(RESULT_RE) ?? m.text.match(RESULT_RE_OLD);
+      if (r) {
+        if (r[1] !== "batch") return resultCard(r[1], r[2]);
+        // a batch RESULT: one card per sub-call ("--- 1/3 list_dir {...}" heads each part)
+        let part = null;
+        for (const line of r[2].split("\n")) {
+          const head = line.match(BATCH_PART_RE);
+          if (head) { if (part) resultCard(part.tool, part.lines.join("\n")); part = { tool: `${head[3]} (${head[1]}/${head[2]})`, lines: head[4].trim() ? [head[4].replace(/^[:\s]+/, "")] : [] }; }
+          else if (part) part.lines.push(line);
+        }
+        return part ? resultCard(part.tool, part.lines.join("\n")) : resultCard("batch", r[2]);
+      }
       if (m.text.startsWith(MARK + " Before you finish")) return msg("status", "(asked Copilot to verify every part of the task before finishing)");
       if (m.text.startsWith(MARK + " You ended with text")) return msg("status", "(Copilot ended with text instead of done: asked it to finish properly)");
       return msg("status", "(asked Copilot to reply with a tool call)");
@@ -411,18 +528,29 @@ async function toggleDiff(card, p) {
   const r = await fetch("/api/changes/diff?path=" + encodeURIComponent(p));
   if (!r.ok) return;
   const { lines } = await r.json();
-  const view = el("pre", "diff");
-  // unchanged runs longer than 6 lines collapse to their first and last 2 lines
-  for (let i = 0; i < lines.length;) {
-    if (lines[i].t !== " ") { view.append(el("span", lines[i].t === "+" ? "add" : "del", lines[i].t + " " + lines[i].s)); i++; continue; }
-    let j = i; while (j < lines.length && lines[j].t === " ") j++;
-    const run = lines.slice(i, j);
-    const show = run.length > 6 ? [...run.slice(0, 2), null, ...run.slice(-2)] : run;
-    for (const l of show) view.append(l ? el("span", "", "  " + l.s) : el("span", "gap", `  … ${run.length - 4} unchanged lines`));
-    i = j;
-  }
-  card.append(view);
+  card.append(diffView(lines));
 }
+// ── Running: the background programs the process tool started (dev servers, watchers), with a Stop button each ──
+function renderProcs(list) {
+  const box = $("procs");
+  box.hidden = !list.length;
+  box.replaceChildren();
+  if (!list.length) return;
+  box.append(el("b", "", "Running:"));
+  for (const p of list) {
+    const row = el("span", "proc" + (p.exit == null ? "" : " ended"));
+    const age = Math.round((Date.now() - p.startedAt) / 60000);
+    row.title = p.text;
+    row.append(el("span", "", p.name), el("code", "", p.command), ...(p.port ? [el("span", "", `:${p.port}`)] : []),
+      el("span", "", p.exit == null ? (age < 1 ? "just started" : `${age} min`) : p.stopped ? "stopped" : `exited (${p.exit})`));
+    const stop = el("button", "", p.exit == null ? "Stop" : "Clear");
+    stop.onclick = () => post("/api/processes/stop", { name: p.name });
+    row.append(stop);
+    box.append(row);
+  }
+  if (list.length > 1) { const all = el("button", "", "Stop all"); all.onclick = () => post("/api/processes/stop-all"); box.append(all); }
+}
+
 $("keepAll").onclick = () => post("/api/changes/keep");
 $("undoAll").onclick = async () => {
   if (!confirm("Undo every change listed here? New files the agent created are removed; changed files get their original back.")) return;
@@ -494,7 +622,7 @@ es.onmessage = (e) => {
   const ev = JSON.parse(e.data);
   switch (ev.type) {
     case "busy": setBusy(true); break;
-    case "idle": setBusy(false); break;
+    case "idle": setBusy(false); attention.clear(); setAttention(null, null); break;
     case "chats": chats = ev.chats; $("closedNote").hidden = true; renderChats(); setTitle(); break;
     case "copilot-closed": $("closedNote").hidden = false; break;
     case "created": // the Copilot chat our first message just started
@@ -508,37 +636,17 @@ es.onmessage = (e) => {
       break;
     }
     case "reply": clearStatus(); factsList(msg("copilot", ev.text), ev.facts); break;
-    case "call": clearStatus(); callCard(ev.call); break;
-    case "approve": {
-      const d = add(el("div", "msg"));
-      d.append(el("div", "label", "Copilot wants to run this. Check it first."), el("div", "call-name", ev.call.tool));
-      const text = argsText(ev.call.args), block = blockOf(ev.call.args);
-      if (text) d.append(pre(text));
-      if (block) d.append(el("div", "label", block.label), pre(block.text));
-      if (ev.warning) d.append(el("div", "warn-note", "⚠ " + ev.warning));
-      const row = el("div", "actions");
-      const once = el("button", "primary", "Allow once"), always = el("button", "", "Always allow"), deny = el("button", "", "Deny");
-      const task = ev.task ? el("button", "", "Allow for this task") : null;
-      always.title = "Don't ask again for " + ev.always;
-      if (task) task.title = "Don't ask again for " + ev.task;
-      const answer = (decision, text) => {
-        [once, task, always, deny].forEach((b) => b && (b.disabled = true));
-        fetch("/api/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: ev.id, decision }) });
-        row.append(el("span", "", text));
-      };
-      once.onclick = () => answer("once", "allowed once");
-      if (task) task.onclick = () => answer("task", "allowed for this task");
-      always.onclick = () => answer("always", "allowed, and saved");
-      deny.onclick = () => answer("deny", "denied");
-      row.append(...[once, task, always, deny].filter(Boolean));
-      d.append(row);
-      if (ev.unkept) d.append(el("div", "always-note", `${ev.unkept} changed file(s) are not kept yet, so this asks even if you allowed it before: it may run that code.`));
-      if (ev.task) d.append(el("div", "always-note", "Allow for this task = no more questions for " + ev.task));
-      d.append(el("div", "always-note", "Always allow = never ask again for " + ev.always));
+    case "call": clearStatus(); callCard(ev.call, ev); break;
+    case "approve": clearStatus(); approveCard(ev); break;
+    case "approved": { // answered here or in another tab, or stopped
+      const what = ev.decision === "deny" ? (ev.kind === "stop" ? "stopped" : `denied (${ev.kind ?? "ask"})${ev.reason ? ": " + ev.reason : ""}`) : ev.decision === "once" ? "allowed once" : ev.decision === "task" ? "allowed for this task" : "allowed, and saved";
+      closeCard(ev.id, what);
       break;
     }
-    case "allowed": msg("status", "Allowed by your rule: " + ev.text); break;
+    case "answered": closeCard(ev.id, "answered"); break;
+    case "allowed": msg("status", `Allowed by your ${ev.source === "task" ? "task grant" : "rule"}${ev.source === "task" && ev.unkept ? ` (${ev.unkept} changed file(s) not kept yet)` : ""}: ${ev.text}`); break;
     case "changes": renderChanges(ev.changes); break;
+    case "processes": renderProcs(ev.processes); break;
     case "rules": rules = ev.rules; renderRules(); break;
     case "result": resultCard(ev.tool, ev.text, ev); break;
     case "question": clearStatus(); questionCard(ev); break;
@@ -552,8 +660,22 @@ es.onmessage = (e) => {
   }
 };
 
+// the cards a running task is waiting for (after a reload, or when the event stream reconnected)
+function showWaiting(s) {
+  if (!s.busy) return;
+  setStatus(`task running: step ${s.currentStep || "?"}…`);
+  for (const ev of s.waiting?.approvals ?? []) approveCard(ev);
+  for (const ev of s.waiting?.questions ?? []) questionCard(ev);
+}
+es.onopen = () => { if (busy) fetch("/api/state").then((r) => r.json()).then(showWaiting).catch(() => {}); };
+
 fetch("/api/state").then((r) => r.json()).then((s) => {
-  chats = s.chats; rules = s.rules ?? []; renderRules(); renderChanges(s.changes ?? []); renderTools(s.tools); setMode(mode); renderChats(); setBusy(s.busy); newChat();
+  chats = s.chats; rules = s.rules ?? []; renderRules(); renderChanges(s.changes ?? []); renderProcs(s.processes ?? []); renderTools(s.tools); setMode(mode); renderChats(); setBusy(s.busy);
+  if (s.busy) { // a task is running (the page was reloaded): keep its cards, skip the "New chat" note
+    viewing = s.current; renderChats(); setTitle();
+    log.replaceChildren(msg("status", "A task is running. Its earlier cards are in the Copilot chat; new ones appear here."));
+    showWaiting(s);
+  } else newChat();
 });
 $("modeAgent").onclick = () => setMode("agent");
 $("modeChat").onclick = () => setMode("chat");

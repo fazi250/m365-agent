@@ -19,7 +19,9 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stopProcesses, type Tool, type ToolContext } from "./tools/_lib.ts";
 import { CopilotWeb } from "./copilot-web.ts";
-import { MARK, agentPrompt, askUserResultMessage, checksMissFailures, compact, correctionMessage, cutResult, diffLines, factLines, parseCall, readOutput, resultMessage, statusOf, verifyPrompt, type Call, type Ledger, type LedgerRun } from "./agent-core.ts";
+import { approveView } from "./approve-view.ts";
+import { describe as describeProcess, listBackground, setBackgroundListener, stopAllBackground, stopBackground, sweepLeftovers } from "./tools/_procs.ts";
+import { MARK, agentPrompt, askUserResultMessage, batchCalls, checksMissFailures, cleanReason, compact, correctionMessage, cutResult, declinedMessage, diffLines, factLines, noteLine, parseCall, quoteMarker, readOutput, resultMessage, statusOf, suspicious, verifyPrompt, type Call, type DenyKind, type Ledger, type LedgerRun } from "./agent-core.ts";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
@@ -28,6 +30,8 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 // JSON line), used instead of the website.
 const defaults = {
   port: 4317, workspace: "workspace", projects: [] as string[], readRoots: [] as string[], maxSteps: 40, maxResult: 8000,
+  maxCorrections: 4, // replies that were not a valid tool call and were asked again, per task (they cost no step)
+  maxBatch: 6, // tool calls in one batch
   bridgeScript: "", browser: "msedge", pythonIndexUrl: "", copilotUrl: "https://m365.cloud.microsoft/chat",
   replyTimeoutSec: 240, // how long to wait for one Copilot reply
   logFile: "", // the trace (default agent.log next to server.ts; relative to the config file)
@@ -65,6 +69,7 @@ const ctx: ToolContext = {
   projects,
   readRoots: [workspace, ...projects, ...config.readRoots.map((r: string) => path.resolve(r))],
   root: ROOT,
+  configDir: path.dirname(configFile),
   python: path.join(ROOT, ".venv", "Scripts", "python.exe"),
   pythonIndexUrl: String(config.pythonIndexUrl ?? ""),
   browserChannel: config.browser,
@@ -128,7 +133,7 @@ async function captureFailure(cmd: string, error: string) {
 // ── Copilot: one command at a time, since it is one page ──
 type Chat = { id: string; title: string };
 type Msg = { role: "user" | "copilot"; text: string };
-type BridgeResult = { ok: boolean; error?: string; text?: string; chatId?: string; chats?: Chat[]; messages?: Msg[]; closed?: boolean; via?: string };
+type BridgeResult = { ok: boolean; error?: string; text?: string; chatId?: string; chats?: Chat[]; messages?: Msg[]; closed?: boolean; via?: string; timing?: Record<string, number> };
 type BridgeCmd = "list" | "read" | "open" | "ask" | "delete";
 type BridgeOpts = { input?: string; newChat?: boolean; id?: string; noLaunch?: boolean };
 
@@ -148,8 +153,10 @@ function bridge(cmd: BridgeCmd, opts: BridgeOpts = {}): Promise<BridgeResult> {
       r = { ok: false, error: (e instanceof Error ? e.message : String(e)).split("\n")[0] };
     }
     // for ask: how the reply was taken as finished (via button = its Copy Response button; stable30 / progress60 = its
-    // text just stopped changing) and its length, to tell slow replies from slow detection
-    const how = cmd === "ask" && r.ok ? ` via ${r.via ?? "-"}, ${(r.text ?? "").length} chars` : "";
+    // text just stopped changing), its length, and where the time went (the engine's phases), to tell slow replies
+    // from slow detection; npm run diag sums these up per task
+    const phases = r.timing ? ` (${["ready", "newChat", "send", "first", "button", "settle", "chatId"].filter((k) => r.timing![k] != null).map((k) => `${k} ${r.timing![k]}`).join(", ")})` : "";
+    const how = cmd === "ask" && r.ok ? ` via ${r.via ?? "-"}, ${(r.text ?? "").length} chars${phases}` : "";
     log(`copilot ${cmd}${opts.id ? ` ${opts.id}` : ""}${opts.newChat ? " -New" : ""} ${Date.now() - started}ms -> ${r.ok ? `ok${how}` : `ERROR ${r.error}`}`);
     if (!r.ok && !FAKE_BRIDGE) await captureFailure(cmd, String(r.error));
     return r;
@@ -225,60 +232,121 @@ function keepRun(tool: string, text: string, step: number, chat: string): Run {
 // "Always allow" saves a narrow rule (the tool's alwaysRule: an exact command, one file path, ...) in approvals.json;
 // a later call with the same tool and key runs without asking. Rules are listed and removed in the page.
 // "Allow for this task" (tools with a taskRule, e.g. writing files in one repo) lasts until the current task ends.
-type Decision = "once" | "task" | "always" | "deny";
-const taskGrants = new Set<string>(); // "<tool>|<key>", cleared when a new message is sent
+// Deny comes with a kind (fix / skip / ask) and an optional reason, which decide what Copilot is told (declinedMessage).
+type Decision = { d: "once" | "task" | "always" | "deny"; kind?: DenyKind; reason?: string };
+const DECISIONS = ["once", "task", "always", "deny"], DENY_KINDS = ["fix", "skip", "ask"];
+// "Allow for this task" grants: "<tool>|<key>" → the risky unkept files (package.json, scripts, a file the command names)
+// the grant was given with; a new one of those asks once more. Cleared when a new message is sent or Stop is pressed.
+const taskGrants = new Map<string, Set<string>>();
+const RISKY = /(^|[\\/])package\.json$|\.(ps1|psm1|cmd|bat)$/i;
 type Rule = { tool: string; key: string; label: string; added: string };
 const RULES_FILE = path.join(path.dirname(configFile), "approvals.json"); // next to the config in use
 let rules: Rule[] = existsSync(RULES_FILE) ? JSON.parse(readFileSync(RULES_FILE, "utf8")) : [];
 const saveRules = () => writeFileSync(RULES_FILE, JSON.stringify(rules, null, 2) + "\n", "utf8");
 
-const pending = new Map<string, (d: Decision) => void>();
+// a card the page shows and the task waits for; the event is kept so a reloaded page (or a second tab) gets the
+// card again from /api/state, and "approved" / "answered" broadcasts close it everywhere with the real outcome
+type Waiting<T> = { resolve: (v: T) => void; ev: Record<string, unknown> };
+const pending = new Map<string, Waiting<Decision>>();
 let stopRequested = false;
+let currentStep = 0; // of the running task (0: none), for the page after a reload
 
 // ── ask_user: Copilot asks you something (sign in first, pick one, ...) and the task waits for your answer ──
-const questions = new Map<string, (answer: string | null) => void>(); // null: the task was stopped
+const questions = new Map<string, Waiting<string | null>>(); // null: the task was stopped
 function askUser(question: string): Promise<string | null> {
   const id = Math.random().toString(36).slice(2);
-  emit({ type: "question", id, text: question });
-  return new Promise((resolve) => questions.set(id, resolve));
+  const ev = { type: "question", id, text: question, step: currentStep };
+  emit(ev);
+  return new Promise((resolve) => questions.set(id, { resolve, ev }));
 }
 
-function ruleOf(t: Tool, args: Record<string, any>): { key: string; label: string } {
+// what Always allow would remember for a call; null = not offered (a protected path, a flagged command, a script)
+function ruleOf(t: Tool, args: Record<string, any>): { key: string; label: string } | null {
   try { if (t.alwaysRule) return t.alwaysRule(args, ctx); } catch { /* fall back to the exact args */ }
   return { key: JSON.stringify(args), label: `this exact ${t.name} call` };
 }
 
-async function approve(t: Tool, c: Call): Promise<boolean> {
-  if (stopRequested) return false; // Stop was pressed while Copilot was answering: nothing more runs
+// what the running task knows about its own refusals: a call that looks like a declined step done another way gets a
+// warning on its card (the same tool again, or any code-running tool soon after a code-running step was refused)
+type Denial = { tool: string; runsCode: boolean; kind: DenyKind; step: number };
+// taint: a RESULT since that step looked like instructions to the agent; code-running tools and new sites then ask
+// even with a saved rule or task grant
+type TaskState = { step: number; denials: Denial[]; taint: { step: number } | null };
+type Verdict = { ok: boolean; kind?: DenyKind; reason?: string };
+
+async function approve(t: Tool, c: Call, state: TaskState): Promise<Verdict> {
+  if (stopRequested) return { ok: false }; // Stop was pressed while Copilot was answering: nothing more runs
   let ask = true;
   try { ask = t.needsApproval(c.args, ctx); } catch { /* malformed args: ask */ }
-  if (!ask) return true;
-  const rule = ruleOf(t, c.args);
-  const saved = rules.find((r) => r.tool === t.name && r.key === rule.key);
+  if (!ask) return { ok: true };
+  let flags: string[] = [];
+  try { flags = t.flags?.(c.args, ctx) ?? []; } catch { /* no flag lines */ }
+  const rule = flags.length ? null : ruleOf(t, c.args); // a flagged command gets no Always allow
+  const saved = rule && rules.find((r) => r.tool === t.name && r.key === rule.key);
   // a command or script may run files the agent changed and you haven't kept yet: then even a saved rule asks
   const unkept = t.runsCode ? changes.length : 0;
-  if (saved && !unkept) {
-    emit({ type: "allowed", text: `${t.name}: ${saved.label}` });
-    return true;
+  const tainted = !!state.taint && (!!t.runsCode || (t.name === "browser" && c.args.action === "open"));
+  if (saved && !unkept && !tainted) {
+    emit({ type: "allowed", text: `${t.name}: ${saved.label}`, source: "rule" });
+    return { ok: true };
   }
   let task: { key: string; label: string } | null = null;
   try { task = t.taskRule?.(c.args, ctx) ?? null; } catch { /* no task-wide option for this call */ }
-  if (task && taskGrants.has(`${t.name}|${task.key}`)) {
-    emit({ type: "allowed", text: `${t.name}: ${task.label}` });
-    return true;
+  const warnings: string[] = [];
+  // the task grant lets an edit → run → edit loop go on without asking, also over files not kept yet; but a changed
+  // file that a command is likely to run (package.json, a script, the file it names) is shown once more
+  const argsText = JSON.stringify(c.args).toLowerCase();
+  const risky = t.runsCode ? changes.filter((ch) => RISKY.test(ch.path) || argsText.includes(path.basename(ch.path).toLowerCase())).map((ch) => ch.path.toLowerCase()) : [];
+  const grant = task ? taskGrants.get(`${t.name}|${task.key}`) : undefined;
+  if (task && grant && !tainted) {
+    const fresh = risky.filter((p) => !grant.has(p));
+    if (!fresh.length) {
+      emit({ type: "allowed", text: `${t.name}: ${task.label}`, source: "task", unkept });
+      return { ok: true };
+    }
+    warnings.push(`your task grant does not cover these changed files yet: ${fresh.map((p) => path.basename(p)).join(", ")} (not kept; this command may run them)`);
   }
+  if (tainted) warnings.push(`the RESULT ${state.step - state.taint!.step === 0 ? "of this step" : `${state.step - state.taint!.step} step(s) ago`} contained instruction-like text; check that this call is for YOUR request`);
   const id = Math.random().toString(36).slice(2);
-  let warning: string | null = null;
-  try { warning = t.warning?.(c.args, ctx) ?? null; } catch { /* no warning line */ }
-  emit({ type: "approve", id, call: c, always: `${t.name}: ${rule.label}`, task: task ? `${t.name}: ${task.label}` : null, unkept, warning });
-  const d = await new Promise<Decision>((resolve) => pending.set(id, resolve));
-  if (d === "task" && task) taskGrants.add(`${t.name}|${task.key}`);
-  if (d === "always") {
+  try { const w = t.warning?.(c.args, ctx); if (w) warnings.push(w); } catch { /* no warning line */ }
+  // a dev server or watcher started by the process tool may load a changed file at once
+  const watchers = t.changesFiles ? listBackground().filter((p) => p.exit == null) : [];
+  if (watchers.length) warnings.push(`running in the background: ${watchers.map((p) => `${p.name} (${p.command})`).join(", ")}; a watcher may load this file at once`);
+  const recent = state.denials.find((d) => state.step - d.step <= 3 && d.kind !== "fix" && (d.tool === t.name || (t.runsCode && d.runsCode)));
+  if (recent) warnings.push(`you declined a ${recent.tool} step ${state.step - recent.step === 0 ? "just now" : `${state.step - recent.step} step(s) ago`}; this may be the same thing another way`);
+  let show = null;
+  try { show = approveView(t.name, c.args, ctx); } catch { /* the card shows the call without a diff */ }
+  const ev = { type: "approve", id, call: c, always: rule ? `${t.name}: ${rule.label}` : null, task: task ? `${t.name}: ${task.label}` : null, unkept, warning: warnings.join(" · ") || null, flags, show, step: state.step };
+  emit(ev);
+  const d = await new Promise<Decision>((resolve) => pending.set(id, { resolve, ev }));
+  log(`  approval ${t.name}: ${d.d}${d.kind ? ` (${d.kind})` : ""}${d.reason ? ` "${short(d.reason, 80)}"` : ""}${flags.length ? ` flags=[${flags.join("; ")}]` : ""}`);
+  emit({ type: "approved", id, decision: d.d, kind: d.kind ?? null, reason: d.reason ?? "" });
+  if (d.d === "task" && task) taskGrants.set(`${t.name}|${task.key}`, new Set([...(grant ?? []), ...risky]));
+  if (d.d === "always" && rule) { // without a rule, "always" counts as once
     rules.push({ tool: t.name, key: rule.key, label: rule.label, added: new Date().toISOString() });
     saveRules();
     emit({ type: "rules", rules });
   }
-  return d !== "deny";
+  return d.d === "deny" ? { ok: false, kind: d.kind ?? "ask", reason: d.reason ?? "" } : { ok: true };
+}
+
+// ── background programs (the process tool): what the page's Running strip shows, kept current by the registry ──
+const processSummary = () => listBackground().map((p) => ({ name: p.name, pid: p.pid, command: p.command, cwd: p.cwd, port: p.port ?? null, startedAt: p.startedAt, exit: p.exit, stopped: p.stoppedByUser, text: describeProcess(p) }));
+setBackgroundListener(() => emit({ type: "processes", processes: processSummary() }));
+
+// Stop: nothing more runs in this task; open cards close as declined, a running program is ended with everything it
+// started (the note in the page says what), and "Allow for this task" grants end with the task.
+async function stopTask() {
+  stopRequested = true;
+  taskGrants.clear();
+  for (const [id, w] of pending) { pending.delete(id); w.resolve({ d: "deny", kind: "ask" }); emit({ type: "approved", id, decision: "deny", kind: "stop", reason: "" }); }
+  for (const [id, w] of questions) { questions.delete(id); w.resolve(null); emit({ type: "answered", id }); }
+  const { ended, stillRunning } = await stopProcesses();
+  if (ended.length || stillRunning.length) {
+    const text = `Stop: ended ${ended.length} program${ended.length === 1 ? "" : "s"}${ended.length ? ` (${ended.join(", ")}, with what they started)` : ""}${stillRunning.length ? `; still running: ${stillRunning.join(", ")}` : ""}`;
+    log(text);
+    emit({ type: "note", text });
+  }
 }
 
 // ── Keep / Undo: files the agent changed, until you keep or undo them ──
@@ -414,24 +482,90 @@ async function send(chatId: string | null, message: string, toolNames: string[])
       emit({ type: "reply", text: r.text ?? "" });
       log(`task end: reply (${(r.text ?? "").length} characters)`);
     } else {
-      let out = agentPrompt(selected, message, { workspace, projects });
-      let badCalls = 0, toolRuns = 0;
+      let out = agentPrompt(selected, message, { workspace, projects, processes: listBackground().filter((p) => p.exit == null).map(describeProcess), maxBatch: config.maxBatch });
+      let corrections = 0, toolRuns = 0, asked = false;
       const book = newBook();
+      const state: TaskState = { step: 0, denials: [], taint: null };
       const facts = () => factLines(ledgerOf(book));
       const chatKey = () => chatId ?? startedId ?? `task-${taskSeq}`; // the chat the runs belong to (a new chat has its id after the first reply)
+      // a RESULT that reads like instructions to the agent: a NOTE for Copilot, a note in the page, and a taint that
+      // makes code-running tools and new sites ask again for the rest of the task (this agent's own source and docs
+      // hold tool-call samples, so that pattern is skipped for them)
+      const noteFor = (calls: Call[], text: string, step: number): string | undefined => {
+        const own = calls.every((c) => ["read_file", "search_files", "list_dir"].includes(c.tool) && path.resolve(workspace, String(c.args.path ?? ".")).toLowerCase().startsWith(ROOT.toLowerCase() + path.sep));
+        const hit = suspicious(text, { toolJson: !own });
+        if (!hit) return undefined;
+        state.taint = { step };
+        log(`  RESULT looks like instructions at line ${hit.line}: "${short(hit.text, 80)}" (tainted from step ${step})`);
+        emit({ type: "note", text: `Line ${hit.line} of this result looks like instructions aimed at Copilot ("${hit.text}"). Copilot was told it is data; commands and new sites ask again from here on.` });
+        return noteLine(hit);
+      };
+      // one tool call: the approval card, the run, the tidied result (the marker quoted) kept as a run and in the
+      // ledger. stop: a batch goes no further after it (not enabled, declined, threw, or a write without its block).
+      const runCall = async (t: Tool | undefined, call: Call, step: number, batch?: string): Promise<{ result: string; run: Run | null; stop: boolean; why: string }> => {
+        emit({ type: "call", call, tainted: !!state.taint, batch: batch ?? null });
+        let result: string, run: Run | null = null, refused: string | null = null, verdict: Verdict = { ok: false }, stop = false, why = "";
+        try { refused = (await t?.precheck?.(call.args, ctx)) ?? null; } catch { /* a failing precheck never blocks the call */ }
+        if (!t) {
+          result = `tool "${call.tool}" is not enabled in this chat; use one of: ${selected.map((x) => x.name).join(", ")}, ask_user, read_output, batch, done`;
+          stop = true; why = "is not enabled";
+        } else if (refused) { // a script with a syntax error: refused before the approval card
+          result = refused;
+          log(`  tool ${call.tool} refused before approval: ${short(refused, 160)}`);
+        } else if ((verdict = await approve(t, call, state)).ok) {
+          emit({ type: "status", text: `step ${step}: running ${t.name}${batch ? ` (${batch})` : ""}… (Stop ends it)` });
+          toolRuns++;
+          const t1 = Date.now();
+          lastWritten = "";
+          try { result = await t.run(call.args, ctx); } catch (e) { result = `error: ${e instanceof Error ? e.message : e}`; stop = true; why = "failed"; }
+          result = quoteMarker(result); // only the server writes the bare marker
+          if (t.processOutput) result = compact(result, { repeats: true });
+          const { problem, exit } = statusOf(result, { data: !!t.readOnly });
+          if (t.changesFiles && lastWritten && !problem && !result.includes("SYNTAX ERROR")) { const hint = projectChecksHint(lastWritten); if (hint) result += `\n${hint}`; }
+          if (t.blockArg && /^no (content|edits|script)/.test(result)) { stop = true; why = "had no code block"; }
+          run = keepRun(call.tool, result, step, chatKey());
+          log(`  tool ${call.tool} ${short(JSON.stringify(call.args), 160)} ${Date.now() - t1}ms -> ${problem ? `PROBLEM ${short(result, 240)}` : `ok (${result.length} characters)`} [run #${run.n}]`);
+          // the ledger: files written, and every run by what it was (the last status of a repeated command wins)
+          if (t.changesFiles && lastWritten) book.writes.set(lastWritten.toLowerCase(), { path: lastWritten, tool: t.name, step });
+          else { const summary = summarize(t.name, call.args); book.runs.set(`${t.name}|${summary}`, { tool: t.name, summary, step, problem, exit }); }
+          if (!t.readOnly) book.mutatingRuns++;
+          if (t.changesFiles) emitChanges(); // the Keep / Undo list in the page
+        } else {
+          const kind = verdict.kind ?? "ask";
+          result = declinedMessage(kind, verdict.reason);
+          stop = true; why = "was declined";
+          if (!stopRequested) {
+            book.declined.push(`${t.name} ${summarize(t.name, call.args)}${verdict.reason ? ` ("${verdict.reason}")` : ""}`);
+            state.denials.push({ tool: t.name, runsCode: !!t.runsCode, kind, step });
+          }
+          log(`  tool ${call.tool} ${stopRequested ? "not run: stopped" : `declined by the user (${kind})`}`);
+        }
+        return { result, run, stop, why };
+      };
+      // the page gets a result in full (up to 200 KB); Copilot gets its start and its end when it is long
+      const showResult = (tool: string, result: string, run: Run | null, max: number, batch?: string) => {
+        const shown = cutResult(result, max, run?.n ?? 0);
+        emit({ type: "result", tool, text: shown.text, run: run?.n, batch: batch ?? null, ...(shown.cut ? { full: result.slice(0, 200_000), total: result.length, head: shown.head, tail: shown.tail } : {}) });
+        return shown.text;
+      };
       for (let step = 1; step <= config.maxSteps && !stopRequested; step++) {
+        currentStep = state.step = step;
         emit({ type: "status", text: `step ${step}: waiting for Copilot…` });
-        const r = await ask(out, newChat && step === 1);
+        const r = await ask(out, newChat && !asked);
+        asked = true;
         if (stopRequested) break; // Stop was pressed while waiting: the reply is dropped
         if (!r.ok) return emit({ type: "error", text: String(r.error), facts: toolRuns ? facts() : [] });
         const reply = r.text ?? "";
-        const { call, error: parseError } = parseCall(reply, blockArgOf);
+        const { call, error: parseError, blocks, usedBlock, cut } = parseCall(reply, blockArgOf);
         if (!call) {
-          // a reply that tried to be a tool call but isn't valid JSON gets one more chance (twice at most)
-          if (/"tool"\s*:/.test(reply) && ++badCalls <= 2) {
-            log(`  not a valid tool call (${parseError}): "${short(reply, 160)}"`);
-            emit({ type: "status", text: `not a valid tool call (${parseError}); asking Copilot again` });
+          // a reply that tried to be a tool call but isn't one valid JSON call is asked again, with what was wrong;
+          // corrections have their own budget (maxCorrections) and cost no step
+          if (/"tool"\s*:/.test(reply) && corrections < config.maxCorrections) {
+            corrections++;
+            log(`  not a valid tool call (${parseError}): "${short(reply, 160)}" (correction ${corrections}/${config.maxCorrections})`);
+            emit({ type: "status", text: `reply was not a tool call (${parseError}): asking again (${corrections}/${config.maxCorrections})` });
             out = correctionMessage(parseError);
+            step--;
             continue;
           }
           // plain text after tool runs: once, ask for a proper ending (done, ask_user or the next call), with the facts;
@@ -447,7 +581,6 @@ async function send(chatId: string | null, message: string, toolNames: string[])
           if (toolRuns) emit({ type: "note", text: "Copilot stopped without done" });
           return emit({ type: "reply", text: reply, facts: toolRuns ? facts() : [] });
         }
-        badCalls = 0;
         if (call.tool === "done") {
           if (toolRuns && !book.verifyAsked && book.mutatingRuns) { // like a careful engineer: check the whole task once before finishing
             book.verifyAsked = true;
@@ -463,62 +596,74 @@ async function send(chatId: string | null, message: string, toolNames: string[])
         }
         if (call.tool === "ask_user") {
           if (stopRequested) break;
-          emit({ type: "call", call });
+          emit({ type: "call", call, tainted: !!state.taint });
           log(`  ask_user: "${short(call.args.question, 100)}"`);
           const answer = await askUser(String(call.args.question ?? call.args.text ?? "").trim() || "(Copilot asked without a question)");
           if (answer === null || stopRequested) break;
           book.asked++;
-          const result = answer.trim() ? `The user answered: ${answer.trim()}` : "The user pressed Continue: the step you asked for is done.";
+          const result = answer.trim() ? `The user answered: ${quoteMarker(answer.trim())}` : "The user pressed Continue: the step you asked for is done.";
           emit({ type: "result", tool: "ask_user", text: result });
           out = askUserResultMessage(result);
           continue;
         }
         if (call.tool === "read_output") { // more of an earlier run's output of THIS chat (no approval: it was already shown here)
-          emit({ type: "call", call });
+          emit({ type: "call", call, tainted: !!state.taint });
           const run = runs.get(Number(call.args.run));
           const mine = [...runs.values()].filter((x) => x.chat === chatKey()).map((x) => x.n);
           const result = run && run.chat === chatKey() ? readOutput(run, call.args, config.maxResult)
             : `no run #${call.args.run ?? "?"} to read in this chat (its runs: ${mine.join(", ") || "none"}; runs of other chats or before a server restart are not kept)`;
           log(`  read_output ${short(JSON.stringify(call.args), 120)} -> ${result.length} characters`);
           emit({ type: "result", tool: "read_output", text: result });
-          out = resultMessage("read_output", result);
+          out = resultMessage("read_output", result, { note: noteFor([call], result, step) });
+          continue;
+        }
+        if (call.tool === "batch") { // several independent calls, one RESULT; each sub-call is approved and run as on its own
+          const b = batchCalls(call, blocks, usedBlock, blockArgOf, config.maxBatch);
+          if (b.error) {
+            emit({ type: "call", call: { tool: "batch", args: { calls: Array.isArray(call.args.calls) ? call.args.calls.length : call.args.calls }, why: call.why }, tainted: !!state.taint, batch: null });
+            log(`  batch refused: ${short(b.error, 160)}`);
+            emit({ type: "result", tool: "batch", text: b.error, batch: null });
+            out = resultMessage("batch", b.error);
+            continue;
+          }
+          const n = b.calls.length, parts: string[] = [];
+          let used = 0, stopped = "";
+          log(`  batch of ${n}: ${b.calls.map((c) => c.tool).join(", ")}`);
+          for (const [i, sub] of b.calls.entries()) {
+            const t = selected.find((x) => x.name === sub.tool);
+            const args = { ...sub.args };
+            if (t?.blockArg) delete args[t.blockArg];
+            const head = `--- ${i + 1}/${n} ${sub.tool} ${short(JSON.stringify(args), 160)}`;
+            if (stopRequested) break;
+            if (stopped) { parts.push(`${head}: not run (${stopped})`); continue; }
+            const room = config.maxResult - used - 120;
+            if (room < 600) { stopped = "message full: call them next turn"; parts.push(`${head}: not run (${stopped})`); continue; }
+            const r = await runCall(t, sub, step, `${i + 1}/${n}`);
+            if (stopRequested && !r.run) break;
+            const text = showResult(sub.tool, r.result, r.run, room, `${i + 1}/${n}`);
+            parts.push(`${head}\n${text}`);
+            used += head.length + text.length + 2;
+            if (r.stop) stopped = `stopped after ${i + 1}/${n} ${r.why}`;
+          }
+          if (stopRequested) break;
+          const result = parts.join("\n");
+          out = resultMessage("batch", result, { note: noteFor(b.calls, result, step) });
           continue;
         }
         const t = selected.find((x) => x.name === call.tool);
-        emit({ type: "call", call });
-        let result: string, run: Run | null = null, refused: string | null = null;
-        try { refused = (await t?.precheck?.(call.args, ctx)) ?? null; } catch { /* a failing precheck never blocks the call */ }
-        if (!t) {
-          result = `tool "${call.tool}" is not enabled in this chat; use one of: ${selected.map((x) => x.name).join(", ")}, ask_user, read_output, done`;
-        } else if (refused) { // a script with a syntax error: refused before the approval card
-          result = refused;
-          log(`  tool ${call.tool} refused before approval: ${short(refused, 160)}`);
-        } else if (await approve(t, call)) {
-          emit({ type: "status", text: `step ${step}: running ${t.name}… (Stop ends it)` });
-          toolRuns++;
-          const t1 = Date.now();
-          lastWritten = "";
-          try { result = await t.run(call.args, ctx); } catch (e) { result = `error: ${e instanceof Error ? e.message : e}`; }
-          if (t.processOutput) result = compact(result, { repeats: true });
-          const { problem, exit } = statusOf(result, { data: !!t.readOnly });
-          if (t.changesFiles && lastWritten && !problem && !result.includes("SYNTAX ERROR")) { const hint = projectChecksHint(lastWritten); if (hint) result += `\n${hint}`; }
-          run = keepRun(call.tool, result, step, chatKey());
-          log(`  tool ${call.tool} ${short(JSON.stringify(call.args), 160)} ${Date.now() - t1}ms -> ${problem ? `PROBLEM ${short(result, 240)}` : `ok (${result.length} characters)`} [run #${run.n}]`);
-          // the ledger: files written, and every run by what it was (the last status of a repeated command wins)
-          if (t.changesFiles && lastWritten) book.writes.set(lastWritten.toLowerCase(), { path: lastWritten, tool: t.name, step });
-          else { const summary = summarize(t.name, call.args); book.runs.set(`${t.name}|${summary}`, { tool: t.name, summary, step, problem, exit }); }
-          if (!t.readOnly) book.mutatingRuns++;
-          if (t.changesFiles) emitChanges(); // the Keep / Undo list in the page
-        } else {
-          result = "The user declined to run this. Choose another way or use done.";
-          if (!stopRequested) book.declined.push(`${t.name} ${summarize(t.name, call.args)}`);
-          log(`  tool ${call.tool} ${stopRequested ? "not run: stopped" : "declined by the user"}`);
+        if (cut && t?.blockArg && call.args[t.blockArg] == null) { // the code block after the JSON never closed: the reply was cut there
+          emit({ type: "call", call, tainted: !!state.taint });
+          const result = "not run: your reply was cut (the code block after the JSON has no closing fence). Send a shorter file, or the rest with append: true.";
+          log(`  tool ${call.tool} not run: unterminated code block`);
+          emit({ type: "result", tool: call.tool, text: result });
+          out = resultMessage(call.tool, result);
+          continue;
         }
-        if (stopRequested) break;
-        // Copilot gets the start and the end of a long result; the page gets all of it (up to 200 KB)
-        const shown = cutResult(result, config.maxResult, run?.n ?? 0);
-        emit({ type: "result", tool: call.tool, text: shown.text, run: run?.n, ...(shown.cut ? { full: result.slice(0, 200_000), total: result.length, head: shown.head, tail: shown.tail } : {}) });
-        out = resultMessage(call.tool, shown.text);
+        const one = await runCall(t, call, step);
+        if (stopRequested && !one.run) break; // stopped before anything ran: nothing to show
+        const text = showResult(call.tool, one.result, one.run, config.maxResult);
+        if (stopRequested) break; // the step's result (ending in [stopped by the user ...]) is shown; nothing goes to Copilot
+        out = resultMessage(call.tool, text, { note: noteFor([call], text, step) });
       }
       emit({ type: "error", text: stopRequested ? "stopped" : `stopped after ${config.maxSteps} steps`, facts: toolRuns ? facts() : [] });
     }
@@ -610,6 +755,9 @@ const server = http
     if (req.method === "GET" && url.pathname === "/api/state") {
       return json(res, 200, {
         chats, current: currentChat, busy, rules, changes: changeSummary(),
+        // the cards a task is waiting for right now, so a reloaded page (or a second tab) shows them again
+        currentStep: busy ? currentStep : 0, processes: processSummary(),
+        waiting: { approvals: [...pending.values()].map((w) => w.ev), questions: [...questions.values()].map((w) => w.ev) },
         tools: [...tools.values()].map((t) => ({ name: t.name, description: t.description, approval: approvalLabel(t) })),
       });
     }
@@ -695,19 +843,24 @@ const server = http
       send(chatId || null, String(message).trim(), Array.isArray(toolNames) ? toolNames : []);
       return json(res, 202);
     }
+    // decision deny takes kind fix | skip | ask (default ask) and a reason; kind "stop" also stops the task
     if (req.method === "POST" && url.pathname === "/api/approve") {
-      const { id, decision } = await readBody(req);
-      if (!["once", "task", "always", "deny"].includes(decision)) return json(res, 400, { error: "decision: once | task | always | deny" });
-      pending.get(id)?.(decision);
+      const { id, decision, kind, reason } = await readBody(req);
+      if (!DECISIONS.includes(decision)) return json(res, 400, { error: "decision: once | task | always | deny" });
+      const w = pending.get(id);
+      if (!w) return json(res, 404, { error: "no such approval (answered or stopped)" });
       pending.delete(id);
+      w.resolve({ d: decision, kind: decision === "deny" ? (DENY_KINDS.includes(kind) ? kind : "ask") : undefined, reason: decision === "deny" ? cleanReason(reason) : undefined });
+      if (decision === "deny" && kind === "stop") await stopTask();
       return json(res, 204);
     }
     if (req.method === "POST" && url.pathname === "/api/answer") {
       const { id, text } = await readBody(req);
-      const resolve = questions.get(id);
-      if (!resolve) return json(res, 404, { error: "no such question (answered or stopped)" });
+      const w = questions.get(id);
+      if (!w) return json(res, 404, { error: "no such question (answered or stopped)" });
       questions.delete(id);
-      resolve(String(text ?? ""));
+      w.resolve(String(text ?? ""));
+      emit({ type: "answered", id });
       return json(res, 204);
     }
     // npm run diag asks here while the server runs (the Copilot window is this server's). POST, so other web pages
@@ -723,12 +876,21 @@ const server = http
       return json(res, 200, { lines: [...head, ...(await p.catch((e) => [`diag failed: ${e instanceof Error ? e.message : e}`]))] });
     }
     if (req.method === "POST" && url.pathname === "/api/stop") {
-      stopRequested = true;
-      for (const [id, resolve] of pending) { resolve("deny"); pending.delete(id); }
-      for (const [id, resolve] of questions) { resolve(null); questions.delete(id); }
-      const ended = stopProcesses(); // a command still running (a login waiting for input, a long npm install) ends now
-      if (ended) log(`stop: ended ${ended} running program(s)`);
+      await stopTask(); // a command still running (a login waiting for input, a long npm install) ends now
       return json(res, 204);
+    }
+    // the background programs of the process tool: the page's Stop button next to each, and Stop all
+    if (req.method === "POST" && url.pathname === "/api/processes/stop") {
+      const { name } = await readBody(req);
+      const p = await stopBackground(String(name ?? ""));
+      if (!p) return json(res, 404, { error: "no such background process" });
+      log(`background process stopped from the page: ${describeProcess(p)}`);
+      return json(res, 200, { stopped: p.name });
+    }
+    if (req.method === "POST" && url.pathname === "/api/processes/stop-all") {
+      const ended = await stopAllBackground();
+      if (ended.length) log(`background processes stopped from the page: ${ended.map((p) => p.name).join(", ")}`);
+      return json(res, 200, { stopped: ended.map((p) => p.name) });
     }
     json(res, 404);
   });
@@ -736,6 +898,8 @@ server.listen(config.port, "127.0.0.1", () => {
   port = (server.address() as { port: number }).port;
   console.log(`M365 Agent → http://127.0.0.1:${port}   tools: ${[...tools.keys()].join(", ")}`);
   log(`server start: node ${process.version}, port ${port}, copilot ${FAKE_BRIDGE ? `FAKE ${FAKE_BRIDGE}` : config.copilotUrl}, browser ${config.browser}`);
+  const swept = sweepLeftovers(ctx); // background programs an earlier server left running
+  if (swept.length) log(`ended background programs of an earlier server: ${swept.join(", ")}`);
   refreshChats();
   setInterval(() => { if (!busy) refreshChats(true); }, 60_000); // keep the sidebar in sync, without reopening Copilot
 });

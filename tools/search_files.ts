@@ -27,6 +27,10 @@ const tool: Tool = {
     const full = fullPath(args.path, ctx);
     return { key: `dir:${full.toLowerCase()}`, label: `searching in ${full}` };
   },
+  taskRule: (args, ctx) => {
+    const full = fullPath(args.path, ctx);
+    return { key: `dir:${full.toLowerCase()}`, label: `searching in ${full}` };
+  },
   warning: (args, ctx) => {
     const full = fullPath(args.path, ctx);
     const parts = [pathWarning(full, trustedForRead(full, ctx)), wide(full) ? "this is a drive root or your user profile: a wide search" : null].filter(Boolean);

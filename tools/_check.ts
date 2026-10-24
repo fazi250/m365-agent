@@ -6,7 +6,9 @@ import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { jsonErrorPos } from "../agent-core.ts";
 import { runProcess, type ToolContext } from "./_lib.ts";
+export { jsonErrorPos }; // kept here for the tests that import it from the check
 
 export type Check = { status: "ok" | "error" | "skipped"; label: string; text: string };
 
@@ -29,44 +31,6 @@ function lineCol(text: string, pos: number): string {
   const before = text.slice(0, pos);
   const line = before.split("\n").length, col = pos - before.lastIndexOf("\n");
   return `line ${line} col ${col}`;
-}
-
-// where a JSON text stops being valid (Node's own message names no position): a small validator that returns the
-// offset of the first wrong character, or -1 when the text is fine
-export function jsonErrorPos(s: string): number {
-  let i = 0;
-  const ws = () => { while (i < s.length && /[ \t\n\r]/.test(s[i])) i++; };
-  const fail = (at: number): never => { throw at; };
-  const str = () => {
-    if (s[i] !== '"') fail(i);
-    i++;
-    while (i < s.length && s[i] !== '"') {
-      if (s[i] === "\\") { i++; if (s[i] === "u") { if (!/^[0-9a-fA-F]{4}$/.test(s.slice(i + 1, i + 5))) fail(i); i += 4; } else if (!/["\\/bfnrt]/.test(s[i] ?? "")) fail(i); }
-      else if (s.charCodeAt(i) < 0x20) fail(i);
-      i++;
-    }
-    if (s[i] !== '"') fail(i);
-    i++;
-  };
-  const value = (): void => {
-    ws();
-    const c = s[i];
-    if (c === "{") {
-      i++; ws();
-      if (s[i] === "}") { i++; return; }
-      for (;;) { ws(); str(); ws(); if (s[i] !== ":") fail(i); i++; value(); ws(); if (s[i] === ",") { i++; continue; } if (s[i] === "}") { i++; return; } fail(i); }
-    }
-    if (c === "[") {
-      i++; ws();
-      if (s[i] === "]") { i++; return; }
-      for (;;) { value(); ws(); if (s[i] === ",") { i++; continue; } if (s[i] === "]") { i++; return; } fail(i); }
-    }
-    if (c === '"') return str();
-    const m = s.slice(i).match(/^(-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?|true|false|null)/);
-    if (!m) fail(i);
-    i += m![0].length;
-  };
-  try { value(); ws(); if (i < s.length) return i; return -1; } catch (at) { return typeof at === "number" ? at : i; }
 }
 
 const PY_AST = "import ast, sys\nsrc = sys.stdin.read()\ntry:\n    ast.parse(src)\n    print('OK')\nexcept SyntaxError as e:\n    print(f'SYNTAX ERROR line {e.lineno}: {e.msg}')\n";

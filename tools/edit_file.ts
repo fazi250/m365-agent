@@ -4,7 +4,7 @@
 // with the syntax check, so a broken file is seen at once. UTF-8 files only (nothing else is transcoded by mistake).
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { syntaxCheck } from "./_check.ts";
-import { isSensitive, pathRule, pathWarning, writable, type Tool } from "./_lib.ts";
+import { isSensitive, pathRule, pathWarning, protectedPath, writable, type Tool } from "./_lib.ts";
 
 export type Edit = { search: string[]; replace: string[] };
 const fwd = (p: string) => p.replace(/\\/g, "/");
@@ -141,12 +141,13 @@ const tool: Tool = {
   changesFiles: true,
   needsApproval: (args, ctx) => {
     const { full, trusted } = writable(args.path, ctx);
-    return !trusted || isSensitive(full);
+    return !trusted || isSensitive(full) || protectedPath(full, ctx, "write") != null;
   },
-  alwaysRule: (args, ctx) => pathRule(writable(args.path, ctx).full, "writing"),
+  alwaysRule: (args, ctx) => pathRule(writable(args.path, ctx).full, "writing", ctx),
+  taskRule: (args, ctx) => pathRule(writable(args.path, ctx).full, "writing", ctx),
   warning: (args, ctx) => {
     const { full, trusted } = writable(args.path, ctx);
-    return pathWarning(full, trusted)?.replace("what is read goes into the Copilot chat", "the file will be changed") ?? null;
+    return pathWarning(full, trusted, { protectedWhy: protectedPath(full, ctx, "write"), tail: "the file will be changed" });
   },
   run: async (args, ctx) => {
     if (args.edits == null) return "no edits: put the SEARCH/REPLACE blocks in a fenced code block right after the JSON";

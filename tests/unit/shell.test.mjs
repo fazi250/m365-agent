@@ -97,13 +97,12 @@ test("a missing folder is reported as such, not as a missing program", async () 
   assert.match(out, /^error: the folder .*gone does not exist\n\[exit code 1, 0\.0 s\]$/);
 });
 
-test("rule keys: the same folder spelt differently is one key; a script's key is its hash", () => {
+test("rule keys: the same folder spelt differently is one key; a script gets no Always allow", () => {
   const a = shell.alwaysRule({ command: "npm test", cwd: repo.replace(/\\/g, "/") + "/" }, ctx);
   const b = shell.alwaysRule({ command: "npm test", cwd: repo.toUpperCase() }, ctx);
   assert.equal(a.key, b.key);
-  const s1 = shell.alwaysRule({ name: "s", script: "Write-Output 1\n# end" }, ctx), s2 = shell.alwaysRule({ name: "s", script: "Write-Output 2\n# end" }, ctx);
-  assert.ok(s1.key.startsWith("script:") && s1.key !== s2.key);
-  assert.match(s1.label, /^this exact script \(s, [0-9a-f]{8}\)$/);
+  assert.equal(a.label, `the command: npm test (in ${repo.replace(/\\/g, "/")}/)`);
+  assert.equal(shell.alwaysRule({ name: "s", script: "Write-Output 1\n# end" }, ctx), null);
 });
 
 test("a test runner gets CI=true; watch mode off and a runner named only in a comment do not", async () => {

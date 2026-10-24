@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { fullPath, isSensitive, pathRule, pathWarning, runProcess, trustedForRead, type Tool } from "./_lib.ts";
+import { fullPath, isSensitive, pathRule, pathWarning, protectedPath, runProcess, trustedForRead, type Tool } from "./_lib.ts";
 
 const OFFICE = /\.(docx|pptx|xlsx)$/i; // read as text through tools/py/read_office.py, to check documents the agent made
 
@@ -33,12 +33,13 @@ const tool: Tool = {
   readOnly: true,
   needsApproval: (args, ctx) => {
     const full = fullPath(args.path, ctx);
-    return !trustedForRead(full, ctx) || isSensitive(full);
+    return !trustedForRead(full, ctx) || isSensitive(full) || protectedPath(full, ctx, "read") != null;
   },
-  alwaysRule: (args, ctx) => pathRule(fullPath(args.path, ctx), "reading"),
+  alwaysRule: (args, ctx) => pathRule(fullPath(args.path, ctx), "reading", ctx),
+  taskRule: (args, ctx) => pathRule(fullPath(args.path, ctx), "reading", ctx),
   warning: (args, ctx) => {
     const full = fullPath(args.path, ctx);
-    return pathWarning(full, trustedForRead(full, ctx));
+    return pathWarning(full, trustedForRead(full, ctx), { protectedWhy: protectedPath(full, ctx, "read") });
   },
   run: async (args, ctx) => {
     const full = fullPath(args.path, ctx);

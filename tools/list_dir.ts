@@ -15,8 +15,12 @@ const tool: Tool = {
   approvalHint: "your folders run on their own; elsewhere asks first",
   readOnly: true,
   needsApproval: (args, ctx) => !trustedForRead(fullPath(args.path, ctx), ctx),
-  // a folder rule: the listed folder itself
+  // a folder rule: the listed folder itself (for good, or until the task ends)
   alwaysRule: (args, ctx) => {
+    const full = fullPath(args.path, ctx);
+    return { key: `dir:${full.toLowerCase()}`, label: `listing ${full}` };
+  },
+  taskRule: (args, ctx) => {
     const full = fullPath(args.path, ctx);
     return { key: `dir:${full.toLowerCase()}`, label: `listing ${full}` };
   },

@@ -6,7 +6,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { syntaxCheck } from "./_check.ts";
-import { isSensitive, pathRule, pathWarning, writable, type Tool } from "./_lib.ts";
+import { isSensitive, pathRule, pathWarning, protectedPath, writable, type Tool } from "./_lib.ts";
 
 const fwd = (p: string) => p.replace(/\\/g, "/");
 const lastLineOf = (text: string) => text.trimEnd().split("\n").at(-1)!.replace(/[`\r]/g, "").slice(0, 80);
@@ -31,12 +31,13 @@ const tool: Tool = {
   changesFiles: true,
   needsApproval: (args, ctx) => {
     const { full, trusted } = writable(args.path, ctx);
-    return !trusted || isSensitive(full);
+    return !trusted || isSensitive(full) || protectedPath(full, ctx, "write") != null;
   },
-  alwaysRule: (args, ctx) => pathRule(writable(args.path, ctx).full, "writing"),
+  alwaysRule: (args, ctx) => pathRule(writable(args.path, ctx).full, "writing", ctx),
+  taskRule: (args, ctx) => pathRule(writable(args.path, ctx).full, "writing", ctx), // the same folder (or sensitive file) until the task ends
   warning: (args, ctx) => {
     const { full, trusted } = writable(args.path, ctx);
-    return pathWarning(full, trusted)?.replace("what is read goes into the Copilot chat", "the file will be created or replaced") ?? null;
+    return pathWarning(full, trusted, { protectedWhy: protectedPath(full, ctx, "write"), tail: "the file will be created or replaced" });
   },
   run: async (args, ctx) => {
     if (args.content == null) return "no content: put the whole file in a fenced code block right after the JSON";
