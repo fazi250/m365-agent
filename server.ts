@@ -21,7 +21,7 @@ import { stopProcesses, type Tool, type ToolContext } from "./tools/_lib.ts";
 import { CopilotWeb } from "./copilot-web.ts";
 import { approveView } from "./approve-view.ts";
 import { describe as describeProcess, listBackground, setBackgroundListener, stopAllBackground, stopBackground, sweepLeftovers } from "./tools/_procs.ts";
-import { MARK, agentPrompt, askUserResultMessage, batchCalls, checksMissFailures, cleanReason, compact, correctionMessage, cutResult, declinedMessage, diffLines, factLines, noteLine, parseCall, quoteMarker, readOutput, resultMessage, statusOf, suspicious, verifyPrompt, type Call, type DenyKind, type Ledger, type LedgerRun } from "./agent-core.ts";
+import { MARK, MEMORY_FILE, agentPrompt, askUserResultMessage, batchCalls, checksMissFailures, cleanReason, compact, correctionMessage, cutResult, declinedMessage, diffLines, factLines, memorySection, noteLine, parseCall, quoteMarker, readOutput, resultMessage, statusOf, suspicious, verifyPrompt, type Call, type DenyKind, type Ledger, type LedgerRun } from "./agent-core.ts";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
@@ -32,6 +32,7 @@ const defaults = {
   port: 4317, workspace: "workspace", projects: [] as string[], readRoots: [] as string[], maxSteps: 40, maxResult: 8000,
   maxCorrections: 4, // replies that were not a valid tool call and were asked again, per task (they cost no step)
   maxBatch: 6, // tool calls in one batch
+  memoryChars: 4000, // characters of workspace/memory.md (the agent's notes across tasks) pasted into each task prompt; 0 = off
   bridgeScript: "", browser: "msedge", pythonIndexUrl: "", copilotUrl: "https://m365.cloud.microsoft/chat",
   replyTimeoutSec: 240, // how long to wait for one Copilot reply
   logFile: "", // the trace (default agent.log next to server.ts; relative to the config file)
@@ -306,7 +307,7 @@ async function approve(t: Tool, c: Call, state: TaskState): Promise<Verdict> {
     }
     warnings.push(`your task grant does not cover these changed files yet: ${fresh.map((p) => path.basename(p)).join(", ")} (not kept; this command may run them)`);
   }
-  if (tainted) warnings.push(`the RESULT ${state.step - state.taint!.step === 0 ? "of this step" : `${state.step - state.taint!.step} step(s) ago`} contained instruction-like text; check that this call is for YOUR request`);
+  if (tainted) warnings.push(`${state.taint!.step === 0 ? `your notes (${MEMORY_FILE})` : `the RESULT ${state.step - state.taint!.step === 0 ? "of this step" : `${state.step - state.taint!.step} step(s) ago`}`} contained instruction-like text; check that this call is for YOUR request`);
   const id = Math.random().toString(36).slice(2);
   try { const w = t.warning?.(c.args, ctx); if (w) warnings.push(w); } catch { /* no warning line */ }
   // a dev server or watcher started by the process tool may load a changed file at once
@@ -442,6 +443,14 @@ function changeSummary() {
 }
 const emitChanges = () => emit({ type: "changes", changes: changeSummary() });
 
+// ── the agent's notes across tasks: workspace/memory.md. Copilot keeps it with write_file / edit_file (Keep / Undo
+//    like any file), every task prompt gets it as data, and the page's Notes dialog shows, edits or clears it. ──
+const MEMORY_PATH = path.join(workspace, MEMORY_FILE);
+const memoryText = () => readText(MEMORY_PATH).replace(/^﻿/, "");
+// chars: as Copilot counts them (line ends normalised, the marker quoted, trimmed), so the dialog's cap warning agrees with the prompt
+const memorySummary = () => { const t = quoteMarker(memoryText().replace(/\r\n?/g, "\n")).trim(); return { path: MEMORY_PATH, chars: t.length, lines: t ? t.split("\n").length : 0, max: Math.max(0, Number(config.memoryChars) || 0) }; };
+const emitMemory = () => emit({ type: "memory", memory: memorySummary() });
+
 function undoChange(c: Change) {
   if (c.original == null) { if (existsSync(c.path)) rmSync(c.path); } // the agent created it: remove it
   else { mkdirSync(path.dirname(c.path), { recursive: true }); writeFileSync(c.path, Buffer.from(c.original, "base64")); }
@@ -482,12 +491,21 @@ async function send(chatId: string | null, message: string, toolNames: string[])
       emit({ type: "reply", text: r.text ?? "" });
       log(`task end: reply (${(r.text ?? "").length} characters)`);
     } else {
-      let out = agentPrompt(selected, message, { workspace, projects, processes: listBackground().filter((p) => p.exit == null).map(describeProcess), maxBatch: config.maxBatch });
+      // the notes Copilot kept in earlier tasks go in as data; notes that read like instructions taint the task from the start
+      const notesOn = Number(config.memoryChars) > 0;
+      const notes = memorySection(notesOn ? memoryText() : "", Number(config.memoryChars) || 0);
+      let out = agentPrompt(selected, message, { workspace, projects, processes: listBackground().filter((p) => p.exit == null).map(describeProcess), maxBatch: config.maxBatch, memory: notes.block, notesRule: notesOn });
       let corrections = 0, toolRuns = 0, asked = false;
       const book = newBook();
       const state: TaskState = { step: 0, denials: [], taint: null };
+      if (notes.block) log(`  notes: ${memoryText().length} characters from ${MEMORY_FILE}${notes.cut ? " (cut)" : ""}${notes.hit ? `; line ${notes.hit.line} looks like instructions` : ""}`);
+      if (notes.hit) {
+        state.taint = { step: 0 };
+        emit({ type: "note", text: `Line ${notes.hit.line} of your notes (${MEMORY_FILE}) looks like instructions aimed at Copilot ("${notes.hit.text}"). Copilot was told it is data; commands and new sites ask in this task even with a rule. Check the Notes dialog.` });
+      }
       const facts = () => factLines(ledgerOf(book));
       const chatKey = () => chatId ?? startedId ?? `task-${taskSeq}`; // the chat the runs belong to (a new chat has its id after the first reply)
+      const taintTag = () => (state.taint ? (state.taint.step === 0 ? "notes" : "result") : null); // on call events: what looked like instructions
       // a RESULT that reads like instructions to the agent: a NOTE for Copilot, a note in the page, and a taint that
       // makes code-running tools and new sites ask again for the rest of the task (this agent's own source and docs
       // hold tool-call samples, so that pattern is skipped for them)
@@ -503,7 +521,7 @@ async function send(chatId: string | null, message: string, toolNames: string[])
       // one tool call: the approval card, the run, the tidied result (the marker quoted) kept as a run and in the
       // ledger. stop: a batch goes no further after it (not enabled, declined, threw, or a write without its block).
       const runCall = async (t: Tool | undefined, call: Call, step: number, batch?: string): Promise<{ result: string; run: Run | null; stop: boolean; why: string }> => {
-        emit({ type: "call", call, tainted: !!state.taint, batch: batch ?? null });
+        emit({ type: "call", call, tainted: taintTag(), batch: batch ?? null });
         let result: string, run: Run | null = null, refused: string | null = null, verdict: Verdict = { ok: false }, stop = false, why = "";
         try { refused = (await t?.precheck?.(call.args, ctx)) ?? null; } catch { /* a failing precheck never blocks the call */ }
         if (!t) {
@@ -530,6 +548,7 @@ async function send(chatId: string | null, message: string, toolNames: string[])
           else { const summary = summarize(t.name, call.args); book.runs.set(`${t.name}|${summary}`, { tool: t.name, summary, step, problem, exit }); }
           if (!t.readOnly) book.mutatingRuns++;
           if (t.changesFiles) emitChanges(); // the Keep / Undo list in the page
+          if (t.changesFiles && lastWritten && samePath(lastWritten, MEMORY_PATH)) emitMemory(); // the Notes button
         } else {
           const kind = verdict.kind ?? "ask";
           result = declinedMessage(kind, verdict.reason);
@@ -596,7 +615,7 @@ async function send(chatId: string | null, message: string, toolNames: string[])
         }
         if (call.tool === "ask_user") {
           if (stopRequested) break;
-          emit({ type: "call", call, tainted: !!state.taint });
+          emit({ type: "call", call, tainted: taintTag() });
           log(`  ask_user: "${short(call.args.question, 100)}"`);
           const answer = await askUser(String(call.args.question ?? call.args.text ?? "").trim() || "(Copilot asked without a question)");
           if (answer === null || stopRequested) break;
@@ -607,7 +626,7 @@ async function send(chatId: string | null, message: string, toolNames: string[])
           continue;
         }
         if (call.tool === "read_output") { // more of an earlier run's output of THIS chat (no approval: it was already shown here)
-          emit({ type: "call", call, tainted: !!state.taint });
+          emit({ type: "call", call, tainted: taintTag() });
           const run = runs.get(Number(call.args.run));
           const mine = [...runs.values()].filter((x) => x.chat === chatKey()).map((x) => x.n);
           const result = run && run.chat === chatKey() ? readOutput(run, call.args, config.maxResult)
@@ -620,7 +639,7 @@ async function send(chatId: string | null, message: string, toolNames: string[])
         if (call.tool === "batch") { // several independent calls, one RESULT; each sub-call is approved and run as on its own
           const b = batchCalls(call, blocks, usedBlock, blockArgOf, config.maxBatch);
           if (b.error) {
-            emit({ type: "call", call: { tool: "batch", args: { calls: Array.isArray(call.args.calls) ? call.args.calls.length : call.args.calls }, why: call.why }, tainted: !!state.taint, batch: null });
+            emit({ type: "call", call: { tool: "batch", args: { calls: Array.isArray(call.args.calls) ? call.args.calls.length : call.args.calls }, why: call.why }, tainted: taintTag(), batch: null });
             log(`  batch refused: ${short(b.error, 160)}`);
             emit({ type: "result", tool: "batch", text: b.error, batch: null });
             out = resultMessage("batch", b.error);
@@ -652,7 +671,7 @@ async function send(chatId: string | null, message: string, toolNames: string[])
         }
         const t = selected.find((x) => x.name === call.tool);
         if (cut && t?.blockArg && call.args[t.blockArg] == null) { // the code block after the JSON never closed: the reply was cut there
-          emit({ type: "call", call, tainted: !!state.taint });
+          emit({ type: "call", call, tainted: taintTag() });
           const result = "not run: your reply was cut (the code block after the JSON has no closing fence). Send a shorter file, or the rest with append: true.";
           log(`  tool ${call.tool} not run: unterminated code block`);
           emit({ type: "result", tool: call.tool, text: result });
@@ -756,7 +775,7 @@ const server = http
       return json(res, 200, {
         chats, current: currentChat, busy, rules, changes: changeSummary(),
         // the cards a task is waiting for right now, so a reloaded page (or a second tab) shows them again
-        currentStep: busy ? currentStep : 0, processes: processSummary(),
+        currentStep: busy ? currentStep : 0, processes: processSummary(), memory: memorySummary(),
         waiting: { approvals: [...pending.values()].map((w) => w.ev), questions: [...questions.values()].map((w) => w.ev) },
         tools: [...tools.values()].map((t) => ({ name: t.name, description: t.description, approval: approvalLabel(t) })),
       });
@@ -783,7 +802,29 @@ const server = http
       changes = changes.filter((c) => !done.includes(c));
       saveChanges();
       emitChanges();
+      if (done.some((c) => samePath(c.path, MEMORY_PATH))) emitMemory();
       return error ? json(res, 500, { error, done: done.length }) : json(res, 200, { done: done.length });
+    }
+    // the agent's notes across tasks (workspace/memory.md): read, replace or clear them from the page's Notes dialog
+    if (req.method === "GET" && url.pathname === "/api/memory") {
+      return json(res, 200, { ...memorySummary(), text: memoryText() });
+    }
+    // loaded: the text the dialog showed when it opened; when the file changed since (Copilot wrote it, another tab
+    // saved), the save is refused with the current text, so nobody overwrites a note they have not seen
+    if (req.method === "POST" && url.pathname === "/api/memory") {
+      const { text, loaded } = await readBody(req);
+      if (typeof text !== "string") return json(res, 400, { error: 'send {"text": "..."} ("" clears the notes)' });
+      if (text.length > 64_000) return json(res, 400, { error: "notes are limited to 64000 characters" });
+      if (typeof loaded === "string" && loaded !== memoryText()) return json(res, 409, { error: "the notes changed since you opened them (Copilot or another tab wrote them): reopen the dialog", ...memorySummary(), text: memoryText() });
+      // the user has seen and replaced the file: an unkept change of Copilot's to it is settled (Undo would otherwise
+      // remove the user's own notes, or bring cleared ones back)
+      if (changes.some((c) => samePath(c.path, MEMORY_PATH))) { changes = changes.filter((c) => !samePath(c.path, MEMORY_PATH)); saveChanges(); emitChanges(); }
+      const clean = text.replace(/\r\n?/g, "\n").replace(/\s+$/, "");
+      if (clean) { mkdirSync(workspace, { recursive: true }); writeFileSync(MEMORY_PATH, clean + "\n", "utf8"); }
+      else rmSync(MEMORY_PATH, { force: true });
+      log(`notes ${clean ? `replaced from the page (${clean.length} characters)` : "cleared from the page"}`);
+      emitMemory();
+      return json(res, 200, memorySummary());
     }
     if (req.method === "POST" && url.pathname === "/api/rules/remove") {
       const { tool, key } = await readBody(req);

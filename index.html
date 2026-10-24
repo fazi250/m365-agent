@@ -43,7 +43,8 @@
   #deleteChat { color: var(--err); border-color: var(--err); background: transparent; }
   .empty { color: var(--muted); font-size: 13px; padding: 8px 10px; }
   .side-foot { padding: 10px 14px 14px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
-  #rulesBtn { width: 100%; }
+  #rulesBtn, #notesBtn { width: 100%; }
+  #notesText { width: 100%; min-height: 280px; max-height: 70vh; resize: vertical; font: 12.5px/1.45 ui-monospace, Consolas, monospace; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
   .always-note { font-size: 12px; color: var(--muted); margin-top: 6px; overflow-wrap: anywhere; }
   .warn-note { font-size: 13px; color: var(--err); font-weight: 600; margin-top: 4px; overflow-wrap: anywhere; }
   dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text); width: min(640px, 92vw); padding: 18px; }
@@ -136,6 +137,7 @@
     <div id="closedNote" class="empty" hidden>The Copilot window is closed. It opens again (minimized) when you send a message, open a chat or press Sync.</div>
     <div id="chats"><div class="empty">Loading…</div></div>
     <div class="side-foot">
+      <button id="notesBtn" title="The notes Copilot keeps across tasks (workspace/memory.md)">Notes (none)</button>
       <button id="rulesBtn" title="Calls you chose to always allow">Allowed always (0)</button>
       <button id="deleteAll" class="danger" title="Delete every chat in Microsoft 365 Copilot">Delete all chats</button>
     </div>
@@ -158,6 +160,12 @@
       <div class="hint">These run without asking. Remove one and it asks again next time.</div>
       <div id="rulesList"></div>
       <div class="actions" style="justify-content:flex-end"><button id="rulesClose">Close</button></div>
+    </dialog>
+    <dialog id="notesDlg">
+      <h3>Notes across tasks</h3>
+      <div class="hint" id="notesHint">Copilot keeps durable facts here (workspace/memory.md): where repos are, how they are built, your decisions. Every task starts with these notes, as data. Edit them as you like; Save writes the file, Clear removes it.</div>
+      <textarea id="notesText" spellcheck="false" placeholder="(no notes yet; Copilot adds lines as it learns things, or write your own)"></textarea>
+      <div class="actions"><span id="notesInfo" class="grow"></span><button id="notesClear">Clear</button><button id="notesSave" class="primary">Save</button><button id="notesClose">Close</button></div>
     </dialog>
     <section id="changes" hidden aria-label="Files changed by the agent">
       <div class="changes-head">
@@ -226,7 +234,7 @@ function callCard(call, ev = {}) {
   const text = argsText(call.args), block = blockOf(call.args);
   if (text) d.append(pre(text));
   if (block) d.append(el("div", "label", block.label), pre(block.text));
-  if (ev.tainted) d.append(el("div", "warn-note", "⚠ an earlier result in this task looked like instructions to Copilot: check that this call is for your request"));
+  if (ev.tainted) d.append(el("div", "warn-note", `⚠ ${ev.tainted === "notes" ? "your notes (memory.md) looked like instructions to Copilot" : "an earlier result in this task looked like instructions to Copilot"}: check that this call is for your request`));
   return d;
 }
 // a tool's result; a command's trailer line ([exit 0, 2.3 s] / [exit code 1, 14.2 s] / killed / stopped) becomes a
@@ -602,6 +610,54 @@ $("stop").onclick = () => fetch("/api/stop", { method: "POST" });
 $("newChat").onclick = newChat;
 $("rulesBtn").onclick = () => $("rulesDlg").showModal();
 $("rulesClose").onclick = () => $("rulesDlg").close();
+
+// ── Notes across tasks: workspace/memory.md, which Copilot keeps and every task prompt gets as data ──
+let memory = { chars: 0, lines: 0, max: 0 };
+let notesLoaded = null; // the text the dialog showed when it opened: a save sends it, so a note written since is never overwritten
+const notesEdited = () => notesLoaded != null && $("notesText").value !== notesLoaded;
+function renderMemory(m) {
+  memory = m ?? memory;
+  $("notesBtn").textContent = `Notes (${memory.lines ? `${memory.lines} line${memory.lines === 1 ? "" : "s"}` : "none"})`;
+  $("notesInfo").textContent = !memory.max ? "Notes are off (memoryChars 0): Copilot does not get them and is not asked to keep them."
+    : memory.chars ? `${memory.chars.toLocaleString()} characters${memory.chars > memory.max ? ` (only the first ${memory.max.toLocaleString()} reach Copilot: trim them)` : ""}` : "";
+}
+const notesInfo = (text) => { $("notesInfo").textContent = text; };
+async function loadNotes() {
+  const r = await fetch("/api/memory");
+  if (!r.ok) throw new Error("could not read the notes: " + r.status);
+  const m = await r.json();
+  $("notesText").value = notesLoaded = m.text;
+  renderMemory(m);
+}
+$("notesBtn").onclick = () => loadNotes().then(() => $("notesDlg").showModal(), (e) => msg("error", String(e.message)));
+// the file changed while the dialog is open (Copilot wrote it, Keep / Undo, another tab): refresh an untouched box, warn otherwise
+async function notesChanged() {
+  if (!$("notesDlg").open) return;
+  if (!notesEdited()) return loadNotes().catch(() => {});
+  notesInfo("The notes changed on disk while you were editing (Copilot wrote them?): Save will refuse; copy your edits, close and reopen.");
+}
+const saveNotes = async (text, done) => {
+  const r = await post("/api/memory", { text, loaded: notesLoaded });
+  const body = await r.json().catch(() => ({}));
+  if (r.status === 409) { // written since the dialog opened: keep the user's text in the box, show the newer one is on disk
+    if (!notesEdited()) { $("notesText").value = notesLoaded = body.text ?? ""; renderMemory(body); }
+    return notesInfo(body.error + (notesEdited() ? " (your edits are still in the box)" : ""));
+  }
+  if (!r.ok) return notesInfo("Could not save the notes: " + (body.error || r.status));
+  notesLoaded = null;
+  renderMemory(body);
+  $("notesDlg").close();
+  msg("status", done);
+};
+$("notesSave").onclick = () => saveNotes($("notesText").value, "Notes saved (workspace/memory.md).");
+$("notesClear").onclick = () => { if (confirm("Remove every note? Copilot starts the next task without them.")) saveNotes("", "Notes cleared."); };
+const closeNotes = (e) => {
+  if (notesEdited() && !confirm("Discard your edits to the notes?")) { e?.preventDefault(); return; }
+  notesLoaded = null;
+  $("notesDlg").close();
+};
+$("notesClose").onclick = () => closeNotes();
+$("notesDlg").addEventListener("cancel", closeNotes); // Escape
 $("deleteChat").onclick = () => viewing && deleteChat(viewing);
 $("refresh").onclick = () => fetch("/api/chats/refresh", { method: "POST" });
 $("deleteAll").onclick = async () => {
@@ -648,6 +704,7 @@ es.onmessage = (e) => {
     case "changes": renderChanges(ev.changes); break;
     case "processes": renderProcs(ev.processes); break;
     case "rules": rules = ev.rules; renderRules(); break;
+    case "memory": renderMemory(ev.memory); notesChanged(); break;
     case "result": resultCard(ev.tool, ev.text, ev); break;
     case "question": clearStatus(); questionCard(ev); break;
     case "note": msg("status", ev.text); break;
@@ -670,7 +727,7 @@ function showWaiting(s) {
 es.onopen = () => { if (busy) fetch("/api/state").then((r) => r.json()).then(showWaiting).catch(() => {}); };
 
 fetch("/api/state").then((r) => r.json()).then((s) => {
-  chats = s.chats; rules = s.rules ?? []; renderRules(); renderChanges(s.changes ?? []); renderProcs(s.processes ?? []); renderTools(s.tools); setMode(mode); renderChats(); setBusy(s.busy);
+  chats = s.chats; rules = s.rules ?? []; renderRules(); renderChanges(s.changes ?? []); renderProcs(s.processes ?? []); renderMemory(s.memory); renderTools(s.tools); setMode(mode); renderChats(); setBusy(s.busy);
   if (s.busy) { // a task is running (the page was reloaded): keep its cards, skip the "New chat" note
     viewing = s.current; renderChats(); setTitle();
     log.replaceChildren(msg("status", "A task is running. Its earlier cards are in the Copilot chat; new ones appear here."));
